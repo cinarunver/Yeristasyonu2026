@@ -1,0 +1,54 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style> 
+        body { margin: 0; padding: 0; background-color: #000; } 
+        #map { height: 100vh; width: 100vw; background: #000; } 
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script>
+        var map = L.map('map').setView([38.835, 33.393], 5);
+        
+        // Profesyonel Siyah Harita (CartoDB Dark Matter - Engel yemez)
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
+            maxZoom: 19, attribution: '© OpenStreetMap © CartoDB'
+        }).addTo(map);
+
+        var rocketIcon = L.icon({
+            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png',
+            shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+            iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+        });
+
+        var payloadIcon = L.icon({
+            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-orange.png',
+            shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+            iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+        });
+
+        var rocketMarker = null; var payloadMarker = null;
+        var rFirst = true; var pFirst = true;
+
+        function updateRocket(lat, lon) {
+            if (rocketMarker === null) {
+                rocketMarker = L.marker([lat, lon], {icon: rocketIcon}).addTo(map).bindPopup('<b>🚀 Roket</b>').openPopup();
+            } else { rocketMarker.setLatLng([lat, lon]); }
+            if (rFirst) { map.setView([lat, lon], 16); rFirst = false; }
+        }
+
+        function updatePayload(lat, lon) {
+            if (payloadMarker === null) {
+                payloadMarker = L.marker([lat, lon], {icon: payloadIcon}).addTo(map).bindPopup('<b>🛰️ Görev Yükü</b>');
+            } else { payloadMarker.setLatLng([lat, lon]); }
+            if (pFirst) { map.setView([lat, lon], 16); pFirst = false; }
+        }
+    </script>
+</body>
+</html>
