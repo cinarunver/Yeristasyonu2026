@@ -20,9 +20,11 @@ import pyqtgraph as pg
 from OpenGL.GL import *
 from OpenGL.GLU import *
 
-# WebEngine için Hardware Acceleration / Chromium flag'leri (Mac/M1 çakışmalarını önlemek için)
-os.environ["QSG_RHI_BACKEND"] = "opengl"
-os.environ["QT_WEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu-compositing"
+# Çapraz Platform (Cross-Platform) Grafik Motoru Ayarlamaları
+# Sadece Mac (Apple Silicon) üzerinde WebEngine ve OpenGL çakışmasını önlemek için uygulanır.
+if sys.platform == "darwin":
+    os.environ["QSG_RHI_BACKEND"] = "opengl"
+    os.environ["QT_WEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu-compositing"
 
 # ----------------- PYQTGRAPH -----------------
 pg.setConfigOption('background', '#1E1E1E')
@@ -313,14 +315,18 @@ class SerialViewerApp(QMainWindow):
         self.payload_worker = None
 
         self.MAX_POINTS = 300
-        self.r_t = deque(maxlen=self.MAX_POINTS)
+        self.r_t_alt = deque(maxlen=self.MAX_POINTS)
         self.r_alt = deque(maxlen=self.MAX_POINTS)
+        self.r_t_vel = deque(maxlen=self.MAX_POINTS)
         self.r_vel = deque(maxlen=self.MAX_POINTS)
+        self.r_t_acc = deque(maxlen=self.MAX_POINTS)
         self.r_acc = deque(maxlen=self.MAX_POINTS)
         
-        self.p_t = deque(maxlen=self.MAX_POINTS)
+        self.p_t_alt = deque(maxlen=self.MAX_POINTS)
         self.p_alt = deque(maxlen=self.MAX_POINTS)
+        self.p_t_temp = deque(maxlen=self.MAX_POINTS)
         self.p_temp = deque(maxlen=self.MAX_POINTS)
+        self.p_t_press = deque(maxlen=self.MAX_POINTS)
         self.p_press = deque(maxlen=self.MAX_POINTS)
 
         self._setup_ui()
@@ -618,14 +624,26 @@ class SerialViewerApp(QMainWindow):
         if identifier == "rocket":
             try:
                 if len(parts) > 0:
-                    self.rocket_labels["İrtifa (m)"].setText(parts[0])
-                    self.r_t.append(t); self.r_alt.append(float(parts[0]))
+                    try:
+                        v = float(parts[0])
+                        self.rocket_labels["İrtifa (m)"].setText(parts[0])
+                        self.r_alt.append(v)
+                        self.r_t_alt.append(t)
+                    except Exception: pass
                 if len(parts) > 1:
-                    self.rocket_labels["Hız (m/s)"].setText(parts[1])
-                    self.r_vel.append(float(parts[1]))
+                    try:
+                        v = float(parts[1])
+                        self.rocket_labels["Hız (m/s)"].setText(parts[1])
+                        self.r_vel.append(v)
+                        self.r_t_vel.append(t)
+                    except Exception: pass
                 if len(parts) > 2:
-                    self.rocket_labels["İvme (g)"].setText(parts[2])
-                    self.r_acc.append(float(parts[2]))
+                    try:
+                        v = float(parts[2])
+                        self.rocket_labels["İvme (g)"].setText(parts[2])
+                        self.r_acc.append(v)
+                        self.r_t_acc.append(t)
+                    except Exception: pass
                 if len(parts) > 3: 
                     self.rocket_labels["Durum"].setText(parts[3])
                 if len(parts) > 4: 
@@ -645,14 +663,26 @@ class SerialViewerApp(QMainWindow):
         elif identifier == "payload":
             try:
                 if len(parts) > 0:
-                    self.payload_labels["İrtifa (m)"].setText(parts[0])
-                    self.p_t.append(t); self.p_alt.append(float(parts[0]))
+                    try:
+                        v = float(parts[0])
+                        self.payload_labels["İrtifa (m)"].setText(parts[0])
+                        self.p_alt.append(v)
+                        self.p_t_alt.append(t)
+                    except Exception: pass
                 if len(parts) > 1:
-                    self.payload_labels["Sıcaklık (°C)"].setText(parts[1])
-                    self.p_temp.append(float(parts[1]))
+                    try:
+                        v = float(parts[1])
+                        self.payload_labels["Sıcaklık (°C)"].setText(parts[1])
+                        self.p_temp.append(v)
+                        self.p_t_temp.append(t)
+                    except Exception: pass
                 if len(parts) > 2:
-                    self.payload_labels["Basınç (Pa)"].setText(parts[2])
-                    self.p_press.append(float(parts[2]))
+                    try:
+                        v = float(parts[2])
+                        self.payload_labels["Basınç (Pa)"].setText(parts[2])
+                        self.p_press.append(v)
+                        self.p_t_press.append(t)
+                    except Exception: pass
                 if len(parts) > 3: 
                     self.payload_labels["Durum"].setText(parts[3])
                 if len(parts) > 4: 
@@ -681,14 +711,22 @@ class SerialViewerApp(QMainWindow):
                 break
 
     def update_plots(self):
-        if len(self.r_t) > 0:
-            self.curve_r_alt.setData(list(self.r_t), list(self.r_alt))
-            self.curve_r_vel.setData(list(self.r_t), list(self.r_vel))
-            self.curve_r_acc.setData(list(self.r_t), list(self.r_acc))
-        if len(self.p_t) > 0:
-            self.curve_p_alt.setData(list(self.p_t), list(self.p_alt))
-            self.curve_p_temp.setData(list(self.p_t), list(self.p_temp))
-            self.curve_p_press.setData(list(self.p_t), list(self.p_press))
+        try:
+            if len(self.r_t_alt) == len(self.r_alt) and len(self.r_alt) > 0:
+                self.curve_r_alt.setData(list(self.r_t_alt), list(self.r_alt))
+            if len(self.r_t_vel) == len(self.r_vel) and len(self.r_vel) > 0:
+                self.curve_r_vel.setData(list(self.r_t_vel), list(self.r_vel))
+            if len(self.r_t_acc) == len(self.r_acc) and len(self.r_acc) > 0:
+                self.curve_r_acc.setData(list(self.r_t_acc), list(self.r_acc))
+            
+            if len(self.p_t_alt) == len(self.p_alt) and len(self.p_alt) > 0:
+                self.curve_p_alt.setData(list(self.p_t_alt), list(self.p_alt))
+            if len(self.p_t_temp) == len(self.p_temp) and len(self.p_temp) > 0:
+                self.curve_p_temp.setData(list(self.p_t_temp), list(self.p_temp))
+            if len(self.p_t_press) == len(self.p_press) and len(self.p_press) > 0:
+                self.curve_p_press.setData(list(self.p_t_press), list(self.p_press))
+        except Exception: 
+            pass
 
     def append_text(self, text):
         formatted_text = text.replace('\n', '<br/>').replace('\r', '') + '<br/>'
