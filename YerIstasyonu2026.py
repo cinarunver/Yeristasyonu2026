@@ -1,3 +1,95 @@
+# ==============================================================================
+# YER İSTASYONU v2.0 — BINARY TELEMETRI GEÇİŞ TODO LİSTESİ
+# Kaynak: TELEMETRI_FORMATI.md  |  Uçuş yazılımı: UcusYazilimi2026 @ main
+# ==============================================================================
+#
+# ── PAKET FORMATI ─────────────────────────────────────────────────────────────
+# TODO-1 [IMPORT]        : 'import struct' satırını aktif et (şu an yorum satırı)
+#
+# TODO-2 [FORMAT-SABİT]  : Şu iki sabiti dosyanın üst kısmına ekle:
+#   PACKET_FORMAT = '<17f3B'              # little-endian: 17 float + 3 uint8
+#   PACKET_SIZE   = struct.calcsize(PACKET_FORMAT)  # → 71 byte
+#
+# ── SERIAL WORKER ─────────────────────────────────────────────────────────────
+# TODO-3 [SİNYAL-İMZA]  : parsed_data_signal'ı list→dict olarak değiştir:
+#   parsed_data_signal = pyqtSignal(str, dict, float)
+#
+# TODO-4 [OKUMA-MANTIĞI] : SerialWorker.run() içindeki readline()+split(',') bloğunu
+#   sabit boyutlu binary okuma ile değiştir:
+#
+#   if self.serial_conn.in_waiting >= PACKET_SIZE:
+#       raw_bytes = self.serial_conn.read(PACKET_SIZE)
+#       values = struct.unpack(PACKET_FORMAT, raw_bytes)
+#       packet = {
+#           'ivmeX': values[0],  'ivmeY': values[1],  'ivmeZ': values[2],
+#           'gyroX': values[3],  'gyroY': values[4],  'gyroZ': values[5],
+#           'roll':  values[6],  'pitch': values[7],  'yaw':   values[8],
+#           'basinc': values[9], 'bmeSicaklik': values[10],
+#           'irtifa': values[11], 'nem': values[12],
+#           'dikeyHiz': values[13], 'eglimAcisi': values[14],
+#           'gpsEnlem': values[15], 'gpsBoylam': values[16],
+#           'ayrilma1_durum': bool(values[17]),
+#           'ayrilma2_durum': bool(values[18]),
+#           'ucus_durumu': values[19],
+#       }
+#       t = time.time() - self.start_time
+#       self.raw_data_signal.emit(self.identifier, raw_bytes.hex())
+#       self.parsed_data_signal.emit(self.identifier, packet, t)
+#
+# TODO-5 [SENKRON]       : Paket sınırı kaymasına karşı buffer temizleme mekanizması:
+#   Eğer in_waiting > PACKET_SIZE * 3: serial_conn.read(serial_conn.in_waiting)  # flush
+#
+# TODO-6 [SİMÜLATÖR]    : run_simulator() içinde CSV string üretimi yerine struct.pack() kullan:
+#   raw_bytes = struct.pack(PACKET_FORMAT,
+#       ivmeX, ivmeY, ivmeZ, gyroX, gyroY, gyroZ,  # [0-5]
+#       roll, pitch, yaw,                           # [6-8]
+#       basinc, bmeSicaklik, alt, nem, vel, eglim,  # [9-14]
+#       lat, lon,                                   # [15-16]
+#       0, 0, ucus_durumu                           # [17-19]
+#   )
+#   Payload simülatörü kaldırılabilir (tek paket mimarisi).
+#
+# ── UI / LABEL'LAR ────────────────────────────────────────────────────────────
+# TODO-7 [BAUD]          : rocket_baud default'unu 9600→115200 yap (TTL hattı 115200 baud).
+#
+# TODO-8 [UI-LABELS]     : Roket label dict'ini genişlet, eksik alanları ekle:
+#   "Dikey Hız (m/s)"  → packet['dikeyHiz']
+#   "Eğim Açısı (°)"   → packet['eglimAcisi']
+#   "Basınç (Pa)"      → packet['basinc']
+#   "Nem (%)"          → packet['nem']
+#   "Sıcaklık (°C)"    → packet['bmeSicaklik']
+#   "Fünye 1"          → packet['ayrilma1_durum']  ("ATEŞLENDI ✓" / "Pasif")
+#   "Fünye 2"          → packet['ayrilma2_durum']  ("ATEŞLENDI ✓" / "Pasif")
+#   "Uçuş Durumu"      → packet['ucus_durumu']
+#                         {0:'HAZIR', 1:'YÜKSELİYOR', 2:'İNİŞ_1(Drogue)',
+#                          3:'İNİŞ_2(Ana)', 4:'İNDİ'}
+#   "İvme (g)" etiketini "İvme (m/s²)" olarak güncelle.
+#
+# ── PARSE MANTIĞI ─────────────────────────────────────────────────────────────
+# TODO-9 [PARSED-DATA]   : on_parsed_data() metodunu baştan yaz (list→dict):
+#   def on_parsed_data(self, identifier: str, packet: dict, t: float):
+#       if identifier == "rocket":
+#           self.rocket_labels["İrtifa (m)"].setText(f"{packet['irtifa']:.1f}")
+#           self.r_alt.append(packet['irtifa']); self.r_t_alt.append(t)
+#           self.rocket_labels["Dikey Hız (m/s)"].setText(f"{packet['dikeyHiz']:.2f}")
+#           self.r_vel.append(packet['dikeyHiz']); self.r_t_vel.append(t)
+#           self.rocket_labels["İvme (m/s²)"].setText(f"{packet['ivmeZ']:.2f}")
+#           self.r_acc.append(packet['ivmeZ']); self.r_t_acc.append(t)
+#           self.rocket_labels["Uçuş Durumu"].setText(DURUM_ETIKET[packet['ucus_durumu']])
+#           self.rocket_labels["GPS"].setText(f"{packet['gpsEnlem']:.4f}, {packet['gpsBoylam']:.4f}")
+#           self.web_view.page().runJavaScript(f"updateRocket({packet['gpsEnlem']}, {packet['gpsBoylam']});")
+#           self.gl_widget.set_angles(packet['roll'], packet['pitch'], packet['yaw'])
+#           self.rocket_labels["Fünye 1"].setText("ATEŞLENDI ✓" if packet['ayrilma1_durum'] else "Pasif")
+#           self.rocket_labels["Fünye 2"].setText("ATEŞLENDI ✓" if packet['ayrilma2_durum'] else "Pasif")
+#
+# TODO-10 [GPS-FONKSİYON]: process_gps() metodunu kaldır.
+#   GPS artık ayrı float alanlar olarak geliyor; '|' parse gerekmiyor.
+#
+# TODO-11 [PAYLOAD-UI]   : Payload (Görev Yükü) bağlantı grubu ve sekmeleri
+#   devre dışı bırakılabilir ya da kaldırılabilir (tek paket mimarisi).
+#
+# ==============================================================================
+
 import sys
 import os
 import time
@@ -5,6 +97,7 @@ import math
 import random
 import serial
 import serial.tools.list_ports
+import struct  # TODO-1: binary TelemetryPacket ayrıştırma için (aktif et)
 from collections import deque
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QComboBox, QPushButton, 
