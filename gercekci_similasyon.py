@@ -1,6 +1,22 @@
 import time
 import math
 import random
+import struct
+
+# --- PROTOKOL SABİTLERİ (YerIstasyonu2026.py ile aynı olmalı) ---
+PACKET_FORMAT = '<17f3B'  # 17 float + 3 uint8
+PACKET_SIZE   = struct.calcsize(PACKET_FORMAT) # 71 byte
+SYNC_1, SYNC_2 = 0xAA, 0x55
+FRAME_SIZE    = 2 + 1 + PACKET_SIZE + 2 # 76 byte
+
+def crc16_ccitt(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+            crc &= 0xFFFF
+    return crc
 
 def run_simulation():
     # Temel Fiziksel Değerler
@@ -9,105 +25,105 @@ def run_simulation():
     
     altitude = 0.0
     velocity = 0.0
-    acceleration = 1.0 # Dünya yerçekimi 1G
+    acceleration_z = 1.0 # Dünya yerçekimi 1G
     
     # Açısal Değerler
     roll = 0.0
     pitch = 0.0
     yaw = 0.0
     
-    # Başlangıç GPS (Örnek: Tuz Gölü)
+    # Başlangıç GPS (Tuz Gölü)
     lat = 38.83510
     lon = 33.39320
     
-    state = "BEKLEMEDE"
+    ucus_durumu = 0 # 0: HAZIR, 1: YÜKSELİYOR, 2: İNİŞ_1, 3: İNİŞ_2, 4: İNDİ
+    ayrilma1 = 0
+    ayrilma2 = 0
     
-    print("🚀 Gerçekçi Roket Uçuş Simülatörü Başlıyor (10 Hz)...")
-    print("Çıkış için CTRL+C tuşlarına basabilirsiniz.\n")
+    print(f"🚀 Gerçekçi Roket BINARY Simülatörü Başlıyor (76 Byte Frame)")
+    print(f"Protokol: [AA 55][LEN={PACKET_SIZE}][PAYLOAD][CRC16]")
     print("-" * 70)
     
     try:
         while True:
-            # FİZİK MOTORU SİMÜLASYONU
-            if time_elapsed < 5.0:
-                # 1. Aşama: Rampada bekleme
-                state = "RAMPADA"
-                altitude = 0.0
+            # --- FİZİK MOTORU ---
+            if time_elapsed < 3.0:
+                ucus_durumu = 0 # HAZIR
+                acceleration_z = 1.0 + random.uniform(-0.02, 0.02)
                 velocity = 0.0
-                acceleration = 1.0 + random.uniform(-0.01, 0.01)
-                
-            elif time_elapsed < 18.0:
-                # 2. Aşama: Motor Ateşlemesi (Sert ivmelenme)
-                state = "MOTOR_ATESLENDI"
-                acceleration = 12.5 + random.uniform(-0.5, 0.5) # 12.5g itki
-                velocity += (acceleration * 9.81) * dt
+                altitude = 0.0
+            elif time_elapsed < 15.0:
+                ucus_durumu = 1 # YÜKSELİYOR
+                acceleration_z = 15.0 + random.uniform(-1.0, 1.0)
+                velocity += (acceleration_z - 1.0) * 9.81 * dt
                 altitude += velocity * dt
-                
-                # GPS Hızla güncellenir
-                lat += 0.00008
-                lon += 0.00003
-                
-            elif time_elapsed < 35.0:
-                # 3. Aşama: Motor Susması / Serbest Uçuş (Sürtünme ile yavaşlama)
-                state = "SERBEST_UCUS_(COAST)"
-                acceleration = -0.8 + random.uniform(-0.1, 0.1) # Serbest düşüş / sürtünme
-                velocity += (acceleration * 9.81) * dt
-                
-                # Hız sıfırın altına düşerse tepe noktası aşılmış demektir
+                lat += 0.00005
+                lon += 0.00002
+            elif time_elapsed < 30.0:
+                ucus_durumu = 1 # HALA YÜKSELİYOR (Coasting)
+                acceleration_z = -0.5 + random.uniform(-0.1, 0.1)
+                velocity += (acceleration_z - 1.0) * 9.81 * dt # -g etkisi
+                altitude += velocity * dt
+                if velocity < 0 and ucus_durumu == 1:
+                    ucus_durumu = 2 # APOGEE - INIS_1
+                    ayrilma1 = 1
+            elif altitude > 500:
+                ucus_durumu = 2 # INIS_1 (Drogue)
+                velocity = -15.0 + random.uniform(-1.0, 1.0)
+                altitude += velocity * dt
+                acceleration_z = 0.0
+            elif altitude > 0:
+                if ucus_durumu == 2:
+                    ucus_durumu = 3 # INIS_2 (Ana Paraşüt)
+                    ayrilma2 = 1
+                velocity = -6.0 + random.uniform(-0.5, 0.5)
                 altitude += velocity * dt
                 if altitude < 0: altitude = 0
-                
-                lat += 0.00004
-                lon += 0.00001
-                
-            elif time_elapsed < 65.0:
-                # 4. Aşama: Paraşüt Açılması (Sabit limit hızda düşüş)
-                state = "PARASUT_ACILDI"
-                acceleration = 0.0 + random.uniform(-0.05, 0.05)
-                velocity = -8.0 + random.uniform(-0.2, 0.2) # Saniyede 8m sabit düşüş
-                altitude += velocity * dt
-                
-                if altitude <= 0:
-                    altitude = 0.0
-                    state = "KURTARMA_BEKLENIYOR"
-                    
-                # Rüzgarla sürüklenme
-                lat -= 0.00001
-                lon += 0.00002
-                
             else:
-                # 5. Aşama: İniş Tamamlandı
-                state = "YERDE"
-                altitude = 0.0
+                ucus_durumu = 4 # İNDİ
                 velocity = 0.0
-                acceleration = 1.0
+                altitude = 0.0
 
-            # HAVADA SARSINTI SİMÜLASYONU (Smooth Sine Waves + Biraz Gürültü)
-            if state in ["MOTOR_ATESLENDI", "SERBEST_UCUS_(COAST)"]:
-                roll = math.sin(time_elapsed * 2.0) * 15.0 + random.uniform(-2, 2)
-                pitch = math.sin(time_elapsed) * 5.0 + random.uniform(-1, 1)
-                yaw = (yaw + 5.0 * dt) % 360  # Yavaşça kendi ekseninde dönme
-            elif state == "PARASUT_ACILDI":
-                roll = math.sin(time_elapsed) * 45.0 # Paraşütte beşik gibi sallanma
-                pitch = math.cos(time_elapsed) * 10.0
-                yaw = (yaw + 2.0 * dt) % 360
-            else:
-                roll = 0.0; pitch = 0.0; yaw = 0.0
-                
-            # VERİYİ PAKETLE (Araya | koyacağız GPS için)
-            gps_str = f"{lat:.5f}|{lon:.5f}"
+            # Yönelim ve Sensörler
+            roll = (roll + 5.0) % 360 if ucus_durumu == 1 else roll
+            pitch = math.sin(time_elapsed) * 10.0
+            yaw = (yaw + 1.0) % 360
             
-            # Format: ROKET,İrtifa,Hız,İvme,Durum,Enlem|Boylam,Roll,Pitch,Yaw
-            packet = f"ROKET,{altitude:.1f},{velocity:.1f},{acceleration:.2f},{state},{gps_str},{roll:.1f},{pitch:.1f},{yaw:.1f}"
+            # Barometrik formül (yaklaşık)
+            basinc = 101325.0 * (1 - 2.25577e-5 * altitude)**5.25588
+            sicaklik = 25.0 - (altitude * 0.0065)
+            nem = 45.0 + random.uniform(-5, 5)
+
+            # --- PAKETLEME (Binary Struct) ---
+            # Format: 17 float + 3 uint8
+            # ivmeX, ivmeY, ivmeZ, gyroX, gyroY, gyroZ, roll, pitch, yaw, 
+            # basinc, sicaklik, irtifa, nem, dikeyHiz, eglimAcisi, gpsLat, gpsLon,
+            # ayrilma1, ayrilma2, ucusDurumu
+            payload = struct.pack(PACKET_FORMAT,
+                random.uniform(-0.1, 0.1), random.uniform(-0.1, 0.1), acceleration_z, # Ivme
+                random.uniform(-1, 1), random.uniform(-1, 1), random.uniform(-1, 1),    # Gyro
+                roll, pitch, yaw,
+                basinc, sicaklik, altitude, nem,
+                velocity, abs(pitch), # Dikey Hız, Eğim Açısı
+                lat, lon,
+                ayrilma1, ayrilma2, ucus_durumu
+            )
             
-            print(packet)
+            # CRC Hesapla
+            crc = crc16_ccitt(payload)
             
-            # Zamanı ilerlet
+            # Çerçeveyi Oluştur (Header + Payload + CRC)
+            # YerIstasyonu2026.py parse_frame bekler: [SYNC1][SYNC2][LEN][PAYLOAD][CRC_HI][CRC_LO]
+            frame = bytes([SYNC_1, SYNC_2, PACKET_SIZE]) + payload + struct.pack('>H', crc)
+            
+            # Ekrana Yazdır (Hex string olarak yer istasyonuna kopyalanabilir)
+            print(f"[{time_elapsed:5.1f}s] Frame: {frame.hex().upper()}")
+            
             time_elapsed += dt
             time.sleep(dt)
-            
+
     except KeyboardInterrupt:
-        print("\n[!] Simülasyon kullanıcı tarafından durduruldu.")
+        print("\n[!] Simülasyon durduruldu.")
 
 if __name__ == "__main__":
     run_simulation()

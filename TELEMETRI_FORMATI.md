@@ -1,209 +1,219 @@
-# Trakya Roket 2026 — Telemetri Protokolü Kılavuzu
+# Trakya Roket 2026 — Telemetri Protokolü Kılavuzu v3.0
 
 Bu belge, **UcusYazilimi2026** (ESP32 Uçuş Bilgisayarı) ve **YerIstasyonu2026** arasındaki telemetri veri formatını açıklamaktadır.
 
-> **⚠️ ÖNEMLİ DEĞIŞIKLIK:** Bu sistem artık CSV/String formatı **kullanmamaktadır**.  
-> Veriler **ham binary (raw binary)** olarak `TelemetryPacket` struct formatında iletilir.  
-> Yer istasyonu bu binary veriyi `struct.unpack()` ile ayrıştırmalıdır.
+> **v3.0 DEĞİŞİKLİĞİ:** Ham binary'e ek olarak artık **SYNC marker + CRC16-CCITT çerçevesi** kullanılmaktadır.  
+> Yer istasyonu bu çerçeveyi SYNC arayarak senkronize olur, CRC ile bütünlüğü doğrular.
 
 ---
 
 ## 1. İletim Mimarisi
 
 ```
-[ESP32 - Core 0]                     [ESP32 - Core 1]
-  Sensör Okuma                          Haberleşme Görevi
-  + Kalman Filtresi        Queue ──▶   Serial.write()  ──▶  PC/TTL (115200)
-  + Uçuş Algoritması       (10 paket)  Serial1.write() ──▶  LoRa (9600)
+[ESP32 - Core 0]                        [ESP32 - Core 1]
+  Sensör Okuma                             Haberleşme Görevi
+  + Kalman Filtresi        Queue ──▶     gonder_paket_framed(Serial)  ──▶  TTL @ 115200 baud (~100 Hz)
+  + Uçuş Algoritması       (10 paket)   gonder_paket_framed(Serial1) ──▶  E32-433T30D @ 9600 baud (~10 Hz)
   + TelemetryPacket doldur
 ```
 
-| Kanal  | Arayüz   | Baud   | Kullanım                |
-|--------|----------|--------|-------------------------|
-| TTL    | UART0    | 115200 | PC / Yer İstasyonu      |
-| LoRa   | UART1    | 9600   | Kablosuz uzak alım      |
+| Kanal | Modül        | Arayüz | Baud   | Gönderim Hızı | Kullanım              |
+|-------|--------------|--------|--------|---------------|-----------------------|
+| TTL   | UART0        | Serial | 115200 | ~100 Hz       | PC / Yer İstasyonu    |
+| LoRa  | E32-433T30D  | UART1  | 9600   | ~10 Hz        | Kablosuz uzak alım    |
 
-**Gönderim yöntemi:** `Serial.write((uint8_t*)&packet, sizeof(packet))`  
-**Frekans:** ~100 Hz (Core 0 döngü hızıyla senkronize)
+> **E32-433T30D Notu:** SX1278 tabanlı, 433 MHz, 30 dBm. Transparent mod — UART'a yazılan baytlar doğrudan RF olarak iletilir. Modül kendi RF katmanında LoRa FEC/CRC yapar; uygulama katmanı CRC'si UART framing güvenliği içindir.
 
 ---
 
-## 2. TelemetryPacket Struct Tanımı
+## 2. Çerçeve Formatı (Framed Packet)
 
-```cpp
-#pragma pack(1)  // Hizalama boşlukları olmadan, sıkıştırılmış binary
-struct TelemetryPacket {
-    float    ivmeX;           // [0]  m/s²  — X ekseni ivme (yerçekimsiz)
-    float    ivmeY;           // [1]  m/s²  — Y ekseni ivme (yerçekimsiz)
-    float    ivmeZ;           // [2]  m/s²  — Z ekseni ivme (yerçekimsiz)
-    float    gyroX;           // [3]  rad/s — X ekseni açısal hız
-    float    gyroY;           // [4]  rad/s — Y ekseni açısal hız
-    float    gyroZ;           // [5]  rad/s — Z ekseni açısal hız
-    float    roll;            // [6]  derece — Euler roll açısı
-    float    pitch;           // [7]  derece — Euler pitch açısı
-    float    yaw;             // [8]  derece — Euler yaw açısı
-    float    basinc;          // [9]  Pascal — Atmosferik basınç
-    float    bmeSicaklik;     // [10] °C     — Hava sıcaklığı
-    float    irtifa;          // [11] metre  — Ground-relative irtifa
-    float    nem;             // [12] %      — Bağıl nem
-    float    dikeyHiz;        // [13] m/s   — Dikey hız (yukarı = pozitif)
-    float    eglimAcisi;      // [14] derece — Yerden eğim (0° = tam dik)
-    float    gpsEnlem;        // [15] decimal degrees — GPS enlem
-    float    gpsBoylam;       // [16] decimal degrees — GPS boylam
-    bool     ayrilma1_durum;  // [17] bool  — 1. Fünye ateşlendi mi? (Drogue)
-    bool     ayrilma2_durum;  // [18] bool  — 2. Fünye ateşlendi mi? (Ana paraşüt)
-    uint8_t  ucus_durumu;     // [19] 0–4   — Aktif uçuş evresi (bkz. §4)
-};
-// Toplam boyut: 17×4 + 2×1 + 1×1 = 71 byte (#pragma pack(1) ile)
+```
+┌──────────┬──────────┬──────────┬─────────────────────────┬───────────────┐
+│ SYNC1[1B]│ SYNC2[1B]│ LEN [1B] │  TelemetryPacket [71B]  │ CRC16  [2B]  │
+│  0xAA    │  0x55    │   71     │  (pragma pack 1 binary) │ HI    LO     │
+└──────────┴──────────┴──────────┴─────────────────────────┴───────────────┘
+Toplam: 2 + 1 + 71 + 2 = 76 byte/çerçeve
 ```
 
-> **Not:** `#pragma pack(1)` direktifi **hem ESP32 tarafında hem Python tarafında** dikkate alınmalıdır.  
-> Python'da `struct.calcsize(FORMAT)` ile boyutu doğrulayın.
+### CRC16-CCITT
+- **Polinom:** 0x1021  
+- **Başlangıç değeri:** 0xFFFF  
+- **Hesaplama kapsamı:** Yalnızca 71 byte `TelemetryPacket` payload'ı (SYNC ve LEN dahil değil)
+
+```python
+def crc16_ccitt(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+            crc &= 0xFFFF
+    return crc
+```
 
 ---
 
-## 3. Paket Boyutu ve Binary Layout
+## 3. TelemetryPacket Struct Tanımı
 
-| Alan           | Tip       | Boyut  | Offset |
-|----------------|-----------|--------|--------|
-| ivmeX          | float32   | 4 byte | 0      |
-| ivmeY          | float32   | 4 byte | 4      |
-| ivmeZ          | float32   | 4 byte | 8      |
-| gyroX          | float32   | 4 byte | 12     |
-| gyroY          | float32   | 4 byte | 16     |
-| gyroZ          | float32   | 4 byte | 20     |
-| roll           | float32   | 4 byte | 24     |
-| pitch          | float32   | 4 byte | 28     |
-| yaw            | float32   | 4 byte | 32     |
-| basinc         | float32   | 4 byte | 36     |
-| bmeSicaklik    | float32   | 4 byte | 40     |
-| irtifa         | float32   | 4 byte | 44     |
-| nem            | float32   | 4 byte | 48     |
-| dikeyHiz       | float32   | 4 byte | 52     |
-| eglimAcisi     | float32   | 4 byte | 56     |
-| gpsEnlem       | float32   | 4 byte | 60     |
-| gpsBoylam      | float32   | 4 byte | 64     |
-| ayrilma1_durum | bool/uint8 | 1 byte | 68    |
-| ayrilma2_durum | bool/uint8 | 1 byte | 69    |
-| ucus_durumu    | uint8      | 1 byte | 70    |
-| **TOPLAM**     |            | **71 byte** |   |
-
----
-
-## 4. Uçuş Durumu (ucus_durumu) Değerleri
-
-| Değer | Sabit      | Açıklama                              |
-|-------|------------|---------------------------------------|
-| `0`   | HAZIR      | Kalkış bekleniyor                     |
-| `1`   | YUKSELIYOR | İvme eşiği aşıldı, roket yükseliyor  |
-| `2`   | INIS_1     | Apogee tespit edildi, Drogue açıldı   |
-| `3`   | INIS_2     | 550m altına inildi, Ana paraşüt açıldı|
-| `4`   | INDI       | Yere iniş tamamlandı, sistem pasif    |
+```cpp
+#pragma pack(push, 1)
+struct TelemetryPacket {
+    float    ivmeX;           // [0]  m/s²  — X ekseni ivme (yerçekimsiz, Kalman)
+    float    ivmeY;           // [1]  m/s²  — Y ekseni ivme
+    float    ivmeZ;           // [2]  m/s²  — Z ekseni ivme (kalkış tespiti için)
+    float    gyroX;           // [3]  rad/s — X açısal hız (Kalman)
+    float    gyroY;           // [4]  rad/s — Y açısal hız
+    float    gyroZ;           // [5]  rad/s — Z açısal hız
+    float    roll;            // [6]  derece — Euler roll (Kalman)
+    float    pitch;           // [7]  derece — Euler pitch
+    float    yaw;             // [8]  derece — Euler yaw
+    float    basinc;          // [9]  Pascal — Atmosferik basınç (Kalman)
+    float    bmeSicaklik;     // [10] °C     — Hava sıcaklığı (Kalman)
+    float    irtifa;          // [11] metre  — Ground-relative irtifa (Kalman)
+    float    nem;             // [12] %      — Bağıl nem (Kalman)
+    float    dikeyHiz;        // [13] m/s    — Dikey hız (irtifadan türev)
+    float    eglimAcisi;      // [14] derece — Yerden eğim (0° = tam dik)
+    float    gpsEnlem;        // [15] decimal degrees
+    float    gpsBoylam;       // [16] decimal degrees
+    bool     ayrilma1_durum;  // [17] Drogue fünye ateşlendi mi?
+    bool     ayrilma2_durum;  // [18] Ana paraşüt fünye ateşlendi mi?
+    uint8_t  ucus_durumu;     // [19] 0–4 (bkz. §5)
+};
+#pragma pack(pop)
+// Toplam: 17×4 + 2×1 + 1×1 = 71 byte
+```
 
 ---
 
-## 5. Python Yer İstasyonu — Parse Yöntemi
+## 4. Binary Layout (Offset Tablosu)
 
-### Format String
+| Alan           | Tip        | Boyut  | Offset |
+|----------------|------------|--------|--------|
+| ivmeX          | float32 LE | 4      | 0      |
+| ivmeY          | float32 LE | 4      | 4      |
+| ivmeZ          | float32 LE | 4      | 8      |
+| gyroX          | float32 LE | 4      | 12     |
+| gyroY          | float32 LE | 4      | 16     |
+| gyroZ          | float32 LE | 4      | 20     |
+| roll           | float32 LE | 4      | 24     |
+| pitch          | float32 LE | 4      | 28     |
+| yaw            | float32 LE | 4      | 32     |
+| basinc         | float32 LE | 4      | 36     |
+| bmeSicaklik    | float32 LE | 4      | 40     |
+| irtifa         | float32 LE | 4      | 44     |
+| nem            | float32 LE | 4      | 48     |
+| dikeyHiz       | float32 LE | 4      | 52     |
+| eglimAcisi     | float32 LE | 4      | 56     |
+| gpsEnlem       | float32 LE | 4      | 60     |
+| gpsBoylam      | float32 LE | 4      | 64     |
+| ayrilma1_durum | uint8      | 1      | 68     |
+| ayrilma2_durum | uint8      | 1      | 69     |
+| ucus_durumu    | uint8      | 1      | 70     |
+| **PAYLOAD TOPLAM** |        | **71** |        |
+
+---
+
+## 5. Uçuş Durumu Değerleri
+
+| Değer | Sabit      | Açıklama                                |
+|-------|------------|-----------------------------------------|
+| `0`   | HAZIR      | Kalkış bekleniyor                       |
+| `1`   | YUKSELIYOR | İvme eşiği aşıldı, yükseliyor          |
+| `2`   | INIS_1     | Apogee tespit edildi, Drogue açıldı     |
+| `3`   | INIS_2     | 550m altına inildi, Ana paraşüt açıldı  |
+| `4`   | INDI       | Yere iniş tamamlandı, sistem pasif      |
+
+---
+
+## 6. Python Yer İstasyonu — Parse Yöntemi
+
+### Sabitler
 
 ```python
 import struct
 
-# '<' = little-endian (ESP32 varsayılan byte sırası)
-# 17f = 17 adet float (her biri 4 byte)
-# 3B  = 3 adet unsigned byte (ayrilma1, ayrilma2, ucus_durumu)
-PACKET_FORMAT = '<17f3B'
-PACKET_SIZE   = struct.calcsize(PACKET_FORMAT)  # → 71 byte olmalı
+PACKET_FORMAT = '<17f3B'                       # little-endian
+PACKET_SIZE   = struct.calcsize(PACKET_FORMAT) # 71 byte
+SYNC_1, SYNC_2 = 0xAA, 0x55
+FRAME_SIZE    = 2 + 1 + PACKET_SIZE + 2        # 76 byte
 ```
 
-### Tek Paket Okuma (Serial)
+### Çerçeve Ayrıştırma
 
 ```python
-import serial, struct
-
-PACKET_FORMAT = '<17f3B'
-PACKET_SIZE   = struct.calcsize(PACKET_FORMAT)
-
-ser = serial.Serial('COM3', 115200, timeout=1)  # port ve baud ayarlayın
-
-def read_packet(ser):
-    raw = ser.read(PACKET_SIZE)
-    if len(raw) != PACKET_SIZE:
-        return None
-    values = struct.unpack(PACKET_FORMAT, raw)
-    return {
-        'ivmeX':           values[0],
-        'ivmeY':           values[1],
-        'ivmeZ':           values[2],
-        'gyroX':           values[3],
-        'gyroY':           values[4],
-        'gyroZ':           values[5],
-        'roll':            values[6],
-        'pitch':           values[7],
-        'yaw':             values[8],
-        'basinc':          values[9],
-        'bmeSicaklik':     values[10],
-        'irtifa':          values[11],
-        'nem':             values[12],
-        'dikeyHiz':        values[13],
-        'eglimAcisi':      values[14],
-        'gpsEnlem':        values[15],
-        'gpsBoylam':       values[16],
-        'ayrilma1_durum':  bool(values[17]),
-        'ayrilma2_durum':  bool(values[18]),
-        'ucus_durumu':     values[19],
-    }
+def parse_frame(raw: bytes):
+    if len(raw) != FRAME_SIZE: return None
+    if raw[0] != SYNC_1 or raw[1] != SYNC_2: return None
+    if raw[2] != PACKET_SIZE: return None
+    payload  = raw[3:3 + PACKET_SIZE]
+    crc_recv = (raw[-2] << 8) | raw[-1]
+    if crc16_ccitt(payload) != crc_recv: return None
+    v = struct.unpack(PACKET_FORMAT, payload)
+    return { 'ivmeX': v[0], ..., 'ucus_durumu': v[19] }
 ```
 
-### ⚠️ Senkronizasyon Uyarısı
+### Senkronize Okuma (Serial)
 
-Binary akışta paket sınırları kayabilir (özellikle seri port açılışında buffer'da yarım paket olabilir). Senkronizasyon kaybını önlemek için `YerIstasyonu2026.py`'deki mevcut baud ve timeout ayarlarını koruyun; gerekirse `ser.read_until()` veya sabit boyut okuma ile senkronizasyon döngüsü ekleyin.
+```python
+buf = bytearray()
+while running:
+    buf.extend(ser.read(ser.in_waiting or 1))
+    if len(buf) > FRAME_SIZE * 10:
+        buf = bytearray()  # overflow koruması
+    while len(buf) >= FRAME_SIZE:
+        # SYNC ara
+        idx = next((i for i in range(len(buf)-1)
+                    if buf[i]==SYNC_1 and buf[i+1]==SYNC_2), -1)
+        if idx == -1: buf = buf[-1:]; break
+        buf = buf[idx:]
+        if len(buf) < FRAME_SIZE: break
+        packet = parse_frame(bytes(buf[:FRAME_SIZE]))
+        buf = buf[FRAME_SIZE:]
+        if packet: process(packet)
+```
 
 ---
 
-## 6. Arduino Tarafı — Gönderim Kodu
+## 7. ESP32 Gönderim Kodu (Core 1)
 
 ```cpp
-// Core 1 - Task2code() içinde
-TelemetryPacket packet;
-if (xQueueReceive(telemetryQueue, &packet, portMAX_DELAY) == pdTRUE) {
-    // TTL — PC / Yer İstasyonu
-    Serial.write((uint8_t*)&packet, sizeof(packet));
-    // LoRa — Kablosuz
-    Serial1.write((uint8_t*)&packet, sizeof(packet));
+// gonder_paket_framed(port, packet) fonksiyonu:
+// [0xAA][0x55][71][...TelemetryPacket...][CRC16_HI][CRC16_LO]
+
+void Task2code(void *pvParameters) {
+    TelemetryPacket pkt;
+    uint32_t lora_sayac = 0;
+    for (;;) {
+        if (xQueueReceive(telemetryQueue, &pkt, portMAX_DELAY) == pdTRUE) {
+            gonder_paket_framed(Serial,  pkt);          // TTL → her paket
+            if (++lora_sayac >= LORA_GONDERIM_ORANI) {
+                gonder_paket_framed(Serial1, pkt);      // LoRa → her 10. paket
+                lora_sayac = 0;
+            }
+        }
+    }
 }
 ```
 
-> TX Buffer'lar 1024 byte olarak ayarlandığından `.write()` anlık döner;  
-> UART donanımı gönderimi interrupt ile arka planda tamamlar.
-
 ---
 
-## 7. Kalman Filtresi Parametreleri
+## 8. Kalman Filtresi Parametreleri
 
-Gönderilen tüm float değerler Kalman filtresiyle yumuşatılmıştır:
-
-| Sensör Grubu          | Ölçüm Hatası | Tahmin Hatası | Süreç Gürültüsü |
-|-----------------------|-------------|--------------|-----------------|
-| İvme / Jiroskop / Euler | 0.1       | 0.1          | 0.01            |
-| Basınç                | 2.0         | 2.0          | 0.1             |
-| Sıcaklık              | 0.5         | 0.5          | 0.01            |
-| İrtifa                | 1.5         | 1.5          | 0.1             |
-| Nem                   | 1.0         | 1.0          | 0.1             |
-
----
-
-## 8. GPS Koordinatları
-
-- `gpsEnlem` ve `gpsBoylam` **float** olarak decimal degrees formatında iletilir.
-- Yer istasyonunda harita gösterimi için doğrudan `Leaflet.js` koordinatı olarak kullanılabilir.
-- GPS güncellenmemişse son geçerli değer korunur (TinyGPS++ `isUpdated()` kontrolü).
+| Sensör Grubu            | Ölçüm Hatası | Tahmin Hatası | Süreç Gürültüsü |
+|-------------------------|-------------|--------------|-----------------|
+| İvme / Jiroskop / Euler | 0.1         | 0.1          | 0.01            |
+| Basınç                  | 2.0         | 2.0          | 0.1             |
+| Sıcaklık                | 0.5         | 0.5          | 0.01            |
+| İrtifa                  | 1.5         | 1.5          | 0.1             |
+| Nem                     | 1.0         | 1.0          | 0.1             |
 
 ---
 
 ## 9. Sürüm Geçmişi
 
-| Versiyon | Tarih      | Değişiklik                                           |
-|----------|------------|------------------------------------------------------|
-| v1.0     | 2026-04-20 | İlk sürüm — CSV/String format (`ROKET,...`)          |
-| v2.0     | 2026-04-22 | **Breaking:** Ham binary `TelemetryPacket` struct'a geçiş, Kalman filtresi, state machine, Drogue/Ana paraşüt durumları eklendi |
+| Versiyon | Tarih      | Değişiklik                                                              |
+|----------|------------|-------------------------------------------------------------------------|
+| v1.0     | 2026-04-20 | İlk sürüm — CSV/String format (`ROKET,...`)                             |
+| v2.0     | 2026-04-22 | Ham binary `TelemetryPacket` struct, Kalman, state machine              |
+| v3.0     | 2026-04-25 | **Framed Protocol:** SYNC(0xAA 0x55) + CRC16-CCITT, E32-433T30D desteği, LoRa 10 Hz rate limiting |

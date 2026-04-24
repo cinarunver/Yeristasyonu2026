@@ -1,93 +1,7 @@
 # ==============================================================================
-# YER İSTASYONU v2.0 — BINARY TELEMETRI GEÇİŞ TODO LİSTESİ
-# Kaynak: TELEMETRI_FORMATI.md  |  Uçuş yazılımı: UcusYazilimi2026 @ main
-# ==============================================================================
-#
-# ── PAKET FORMATI ─────────────────────────────────────────────────────────────
-# TODO-1 [IMPORT]        : 'import struct' satırını aktif et (şu an yorum satırı)
-#
-# TODO-2 [FORMAT-SABİT]  : Şu iki sabiti dosyanın üst kısmına ekle:
-#   PACKET_FORMAT = '<17f3B'              # little-endian: 17 float + 3 uint8
-#   PACKET_SIZE   = struct.calcsize(PACKET_FORMAT)  # → 71 byte
-#
-# ── SERIAL WORKER ─────────────────────────────────────────────────────────────
-# TODO-3 [SİNYAL-İMZA]  : parsed_data_signal'ı list→dict olarak değiştir:
-#   parsed_data_signal = pyqtSignal(str, dict, float)
-#
-# TODO-4 [OKUMA-MANTIĞI] : SerialWorker.run() içindeki readline()+split(',') bloğunu
-#   sabit boyutlu binary okuma ile değiştir:
-#
-#   if self.serial_conn.in_waiting >= PACKET_SIZE:
-#       raw_bytes = self.serial_conn.read(PACKET_SIZE)
-#       values = struct.unpack(PACKET_FORMAT, raw_bytes)
-#       packet = {
-#           'ivmeX': values[0],  'ivmeY': values[1],  'ivmeZ': values[2],
-#           'gyroX': values[3],  'gyroY': values[4],  'gyroZ': values[5],
-#           'roll':  values[6],  'pitch': values[7],  'yaw':   values[8],
-#           'basinc': values[9], 'bmeSicaklik': values[10],
-#           'irtifa': values[11], 'nem': values[12],
-#           'dikeyHiz': values[13], 'eglimAcisi': values[14],
-#           'gpsEnlem': values[15], 'gpsBoylam': values[16],
-#           'ayrilma1_durum': bool(values[17]),
-#           'ayrilma2_durum': bool(values[18]),
-#           'ucus_durumu': values[19],
-#       }
-#       t = time.time() - self.start_time
-#       self.raw_data_signal.emit(self.identifier, raw_bytes.hex())
-#       self.parsed_data_signal.emit(self.identifier, packet, t)
-#
-# TODO-5 [SENKRON]       : Paket sınırı kaymasına karşı buffer temizleme mekanizması:
-#   Eğer in_waiting > PACKET_SIZE * 3: serial_conn.read(serial_conn.in_waiting)  # flush
-#
-# TODO-6 [SİMÜLATÖR]    : run_simulator() içinde CSV string üretimi yerine struct.pack() kullan:
-#   raw_bytes = struct.pack(PACKET_FORMAT,
-#       ivmeX, ivmeY, ivmeZ, gyroX, gyroY, gyroZ,  # [0-5]
-#       roll, pitch, yaw,                           # [6-8]
-#       basinc, bmeSicaklik, alt, nem, vel, eglim,  # [9-14]
-#       lat, lon,                                   # [15-16]
-#       0, 0, ucus_durumu                           # [17-19]
-#   )
-#   Payload simülatörü kaldırılabilir (tek paket mimarisi).
-#
-# ── UI / LABEL'LAR ────────────────────────────────────────────────────────────
-# TODO-7 [BAUD]          : rocket_baud default'unu 9600→115200 yap (TTL hattı 115200 baud).
-#
-# TODO-8 [UI-LABELS]     : Roket label dict'ini genişlet, eksik alanları ekle:
-#   "Dikey Hız (m/s)"  → packet['dikeyHiz']
-#   "Eğim Açısı (°)"   → packet['eglimAcisi']
-#   "Basınç (Pa)"      → packet['basinc']
-#   "Nem (%)"          → packet['nem']
-#   "Sıcaklık (°C)"    → packet['bmeSicaklik']
-#   "Fünye 1"          → packet['ayrilma1_durum']  ("ATEŞLENDI ✓" / "Pasif")
-#   "Fünye 2"          → packet['ayrilma2_durum']  ("ATEŞLENDI ✓" / "Pasif")
-#   "Uçuş Durumu"      → packet['ucus_durumu']
-#                         {0:'HAZIR', 1:'YÜKSELİYOR', 2:'İNİŞ_1(Drogue)',
-#                          3:'İNİŞ_2(Ana)', 4:'İNDİ'}
-#   "İvme (g)" etiketini "İvme (m/s²)" olarak güncelle.
-#
-# ── PARSE MANTIĞI ─────────────────────────────────────────────────────────────
-# TODO-9 [PARSED-DATA]   : on_parsed_data() metodunu baştan yaz (list→dict):
-#   def on_parsed_data(self, identifier: str, packet: dict, t: float):
-#       if identifier == "rocket":
-#           self.rocket_labels["İrtifa (m)"].setText(f"{packet['irtifa']:.1f}")
-#           self.r_alt.append(packet['irtifa']); self.r_t_alt.append(t)
-#           self.rocket_labels["Dikey Hız (m/s)"].setText(f"{packet['dikeyHiz']:.2f}")
-#           self.r_vel.append(packet['dikeyHiz']); self.r_t_vel.append(t)
-#           self.rocket_labels["İvme (m/s²)"].setText(f"{packet['ivmeZ']:.2f}")
-#           self.r_acc.append(packet['ivmeZ']); self.r_t_acc.append(t)
-#           self.rocket_labels["Uçuş Durumu"].setText(DURUM_ETIKET[packet['ucus_durumu']])
-#           self.rocket_labels["GPS"].setText(f"{packet['gpsEnlem']:.4f}, {packet['gpsBoylam']:.4f}")
-#           self.web_view.page().runJavaScript(f"updateRocket({packet['gpsEnlem']}, {packet['gpsBoylam']});")
-#           self.gl_widget.set_angles(packet['roll'], packet['pitch'], packet['yaw'])
-#           self.rocket_labels["Fünye 1"].setText("ATEŞLENDI ✓" if packet['ayrilma1_durum'] else "Pasif")
-#           self.rocket_labels["Fünye 2"].setText("ATEŞLENDI ✓" if packet['ayrilma2_durum'] else "Pasif")
-#
-# TODO-10 [GPS-FONKSİYON]: process_gps() metodunu kaldır.
-#   GPS artık ayrı float alanlar olarak geliyor; '|' parse gerekmiyor.
-#
-# TODO-11 [PAYLOAD-UI]   : Payload (Görev Yükü) bağlantı grubu ve sekmeleri
-#   devre dışı bırakılabilir ya da kaldırılabilir (tek paket mimarisi).
-#
+# YER İSTASYONU v3.0 — FRAMED BINARY TELEMETRİ PROTOKOLü
+# ESP32 (UcusYazilimi2026) → E32-433T30D LoRa / TTL → Bu uygulama
+# Protokol: [0xAA][0x55][LEN=71][TelemetryPacket 71B][CRC16_HI][CRC16_LO]
 # ==============================================================================
 
 import sys
@@ -95,10 +9,54 @@ import os
 import time
 import math
 import random
+import struct
 import serial
 import serial.tools.list_ports
-import struct  # TODO-1: binary TelemetryPacket ayrıştırma için (aktif et)
 from collections import deque
+
+# --- PAKET SABİTLERİ ---
+PACKET_FORMAT = '<17f3B'                       # little-endian: 17 float + 3 uint8
+PACKET_SIZE   = struct.calcsize(PACKET_FORMAT) # 71 byte
+SYNC_1, SYNC_2 = 0xAA, 0x55
+FRAME_SIZE    = 2 + 1 + PACKET_SIZE + 2        # 76 byte
+
+DURUM_ETIKET = {
+    0: 'HAZIR',
+    1: 'YÜKSELİYOR',
+    2: 'İNİŞ_1 (Drogue)',
+    3: 'İNİŞ_2 (Ana Paraşüt)',
+    4: 'İNDİ ✓',
+}
+
+def crc16_ccitt(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+            crc &= 0xFFFF
+    return crc
+
+def parse_frame(raw: bytes):
+    """76 byte çerçeveyi ayrıştırır. Geçersizse None döner."""
+    if len(raw) != FRAME_SIZE: return None
+    if raw[0] != SYNC_1 or raw[1] != SYNC_2: return None
+    if raw[2] != PACKET_SIZE: return None
+    payload = raw[3:3 + PACKET_SIZE]
+    crc_recv = (raw[3 + PACKET_SIZE] << 8) | raw[3 + PACKET_SIZE + 1]
+    if crc16_ccitt(payload) != crc_recv: return None
+    v = struct.unpack(PACKET_FORMAT, payload)
+    return {
+        'ivmeX': v[0],  'ivmeY': v[1],  'ivmeZ': v[2],
+        'gyroX': v[3],  'gyroY': v[4],  'gyroZ': v[5],
+        'roll':  v[6],  'pitch': v[7],  'yaw':   v[8],
+        'basinc': v[9], 'bmeSicaklik': v[10], 'irtifa': v[11], 'nem': v[12],
+        'dikeyHiz': v[13], 'eglimAcisi': v[14],
+        'gpsEnlem': v[15], 'gpsBoylam': v[16],
+        'ayrilma1_durum': bool(v[17]),
+        'ayrilma2_durum': bool(v[18]),
+        'ucus_durumu':    v[19],
+    }
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QComboBox, QPushButton, 
                              QTextEdit, QMessageBox, QGroupBox, QFormLayout, 
@@ -192,7 +150,7 @@ except Exception:
 # ----------------- SERIAL WORKER (QTHREAD) -----------------
 class SerialWorker(QThread):
     raw_data_signal = pyqtSignal(str, str) 
-    parsed_data_signal = pyqtSignal(str, list, float) 
+    parsed_data_signal = pyqtSignal(str, dict, float)
     error_signal = pyqtSignal(str, str)
     disconnected_signal = pyqtSignal(str)
 
@@ -209,7 +167,6 @@ class SerialWorker(QThread):
         if self.port == "Simülatör":
             self.run_simulator()
             return
-
         try:
             self.serial_conn = serial.Serial(self.port, int(self.baudrate), timeout=1)
         except Exception as e:
@@ -217,47 +174,76 @@ class SerialWorker(QThread):
             self.disconnected_signal.emit(self.identifier)
             return
 
+        buf = bytearray()
         while self.is_running and self.serial_conn and self.serial_conn.is_open:
             try:
-                if self.serial_conn.in_waiting > 0:
-                    raw_data = self.serial_conn.readline().decode('utf-8', errors='replace').strip()
-                    if raw_data:
-                        self.raw_data_signal.emit(self.identifier, raw_data)
-                        parts = raw_data.split(',')
-                        if len(parts) > 1:
+                waiting = self.serial_conn.in_waiting
+                if waiting > 0:
+                    buf.extend(self.serial_conn.read(waiting))
+                    # Buffer overflow koruması
+                    if len(buf) > FRAME_SIZE * 10:
+                        buf = bytearray()
+                    # SYNC arayıp çerçeve işle
+                    while len(buf) >= FRAME_SIZE:
+                        idx = -1
+                        for i in range(len(buf) - 1):
+                            if buf[i] == SYNC_1 and buf[i+1] == SYNC_2:
+                                idx = i; break
+                        if idx == -1:
+                            buf = buf[-1:]; break
+                        if idx > 0:
+                            buf = buf[idx:]
+                        if len(buf) < FRAME_SIZE:
+                            break
+                        frame = bytes(buf[:FRAME_SIZE])
+                        buf   = buf[FRAME_SIZE:]
+                        packet = parse_frame(frame)
+                        if packet is not None:
                             t = time.time() - self.start_time
-                            self.parsed_data_signal.emit(self.identifier, parts, t)
+                            self.raw_data_signal.emit(self.identifier, frame.hex())
+                            self.parsed_data_signal.emit(self.identifier, packet, t)
+                else:
+                    self.msleep(5)
             except Exception as e:
                 self.error_signal.emit(self.identifier, f"Okuma hatası: {e}")
                 self.disconnected_signal.emit(self.identifier)
                 break
 
     def run_simulator(self):
-        alt = 0.0
-        vel = 0.0
-        r, p, y = 0.0, 0.0, 0.0
+        alt, vel, acc = 0.0, 0.0, 0.0
+        r, p, yaw_a = 0.0, 0.0, 0.0
         lat, lon = 38.835, 33.393
+        ucus_durumu = 0
 
         while self.is_running:
             t = time.time() - self.start_time
-            r = (r + random.uniform(-5, 5)) % 360
-            p = (p + random.uniform(-2, 2)) % 360
-            y = (y + random.uniform(-1, 1)) % 360
-            alt += 15.0 + random.uniform(-2, 2)
-            vel = 120.0 + random.uniform(-5, 5)
-            acc = 1.2 + random.uniform(-0.1, 0.1)
-            lat += 0.0001
-            lon += 0.0001
-            
-            if self.identifier == "rocket":
-                raw_data = f"ROKET,{alt:.1f},{vel:.1f},{acc:.2f},Ucussim,{lat:.4f}|{lon:.4f},{r:.1f},{p:.1f},{y:.1f}"
-            else:
-                raw_data = f"YUK,{alt:.1f},24.5,101325,Ayrildisim,45.2,{lat-0.002:.4f}|{lon-0.002:.4f}"
-                
-            self.raw_data_signal.emit(self.identifier, raw_data)
-            parts = raw_data.split(',')
-            self.parsed_data_signal.emit(self.identifier, parts, t)
-            self.msleep(50)
+            r    = (r + random.uniform(-2, 2)) % 360
+            p    = (p + random.uniform(-1, 1)) % 360
+            yaw_a = (yaw_a + random.uniform(-0.5, 0.5)) % 360
+            acc  = 30.0 if t < 5 else 0.0
+            vel  = max(0.0, vel + (acc - 9.8) * 0.1)
+            alt  = max(0.0, alt + vel * 0.1)
+            lat += 0.00005; lon += 0.00005
+            if ucus_durumu == 0 and t > 2: ucus_durumu = 1
+            if ucus_durumu == 1 and vel < 0: ucus_durumu = 2
+
+            payload = struct.pack(PACKET_FORMAT,
+                random.uniform(-1,1), random.uniform(-1,1), acc,
+                random.uniform(-.1,.1), random.uniform(-.1,.1), random.uniform(-.1,.1),
+                r, p, yaw_a,
+                101325.0 - alt * 12.0, 25.0 - alt * 0.006, alt,
+                45.0 + random.uniform(-1,1),
+                vel, abs(p % 90),
+                lat, lon,
+                0, 0, ucus_durumu
+            )
+            crc = crc16_ccitt(payload)
+            frame = bytes([SYNC_1, SYNC_2, PACKET_SIZE]) + payload + bytes([(crc>>8)&0xFF, crc&0xFF])
+            packet = parse_frame(frame)
+            if packet:
+                self.raw_data_signal.emit(self.identifier, frame.hex())
+                self.parsed_data_signal.emit(self.identifier, packet, t)
+            self.msleep(100)
 
     def stop(self):
         self.is_running = False
@@ -456,7 +442,7 @@ class SerialViewerApp(QMainWindow):
         self.rocket_cb = QComboBox()
         self.rocket_baud = QComboBox()
         self.rocket_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
-        self.rocket_baud.setCurrentText("9600")
+        self.rocket_baud.setCurrentText("115200")
         self.rocket_connect_btn = QPushButton("Bağlan")
         self.rocket_connect_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self.rocket_disconnect_btn = QPushButton("Kes")
@@ -475,7 +461,20 @@ class SerialViewerApp(QMainWindow):
         rc2_layout.addWidget(self.rocket_disconnect_btn)
 
         r_form_layout = QFormLayout()
-        self.rocket_labels = {"İrtifa (m)": QLabel("-"), "Hız (m/s)": QLabel("-"), "İvme (g)": QLabel("-"), "Durum": QLabel("-"), "GPS": QLabel("-"), "Avionik (R,P,Y)": QLabel("-")}
+        self.rocket_labels = {
+            "İrtifa (m)":      QLabel("-"),
+            "Dikey Hız (m/s)": QLabel("-"),
+            "İvme Z (m/s²)":   QLabel("-"),
+            "Eğim Açısı (°)":  QLabel("-"),
+            "Uçuş Durumu":    QLabel("-"),
+            "GPS":             QLabel("-"),
+            "Aviyonik (R,P,Y)": QLabel("-"),
+            "Basınç (Pa)":     QLabel("-"),
+            "Sıcaklık (°C)":   QLabel("-"),
+            "Nem (%)":         QLabel("-"),
+            "Fünye 1":        QLabel("-"),
+            "Fünye 2":        QLabel("-"),
+        }
         for key, lbl in self.rocket_labels.items():
             lbl.setStyleSheet("color: #2196F3; font-weight: bold; font-size: 15px;")
             r_form_layout.addRow(key + ":", lbl)
@@ -494,7 +493,7 @@ class SerialViewerApp(QMainWindow):
         self.payload_cb = QComboBox()
         self.payload_baud = QComboBox()
         self.payload_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
-        self.payload_baud.setCurrentText("9600")
+        self.payload_baud.setCurrentText("115200")
         self.payload_connect_btn = QPushButton("Bağlan")
         self.payload_connect_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self.payload_disconnect_btn = QPushButton("Kes")
@@ -513,7 +512,17 @@ class SerialViewerApp(QMainWindow):
         pc2_layout.addWidget(self.payload_disconnect_btn)
 
         p_form_layout = QFormLayout()
-        self.payload_labels = {"İrtifa (m)": QLabel("-"), "Sıcaklık (°C)": QLabel("-"), "Basınç (Pa)": QLabel("-"), "Durum": QLabel("-"), "Nem (%)": QLabel("-"), "GPS": QLabel("-")}
+        self.payload_labels = {
+            "İrtifa (m)":      QLabel("-"),
+            "Dikey Hız (m/s)": QLabel("-"),
+            "Sıcaklık (°C)":   QLabel("-"),
+            "Basınç (Pa)":     QLabel("-"),
+            "Nem (%)":         QLabel("-"),
+            "GPS":             QLabel("-"),
+            "Uçuş Durumu":    QLabel("-"),
+            "Fünye 1":        QLabel("-"),
+            "Fünye 2":        QLabel("-"),
+        }
         for key, lbl in self.payload_labels.items():
             lbl.setStyleSheet("color: #FF9800; font-weight: bold; font-size: 15px;")
             p_form_layout.addRow(key + ":", lbl)
@@ -710,98 +719,65 @@ class SerialViewerApp(QMainWindow):
         else:
             self.append_text(f'<span style="color:#FF9800; font-weight:bold;">[G.YÜKÜ]</span> {raw_str}')
 
-    def on_parsed_data(self, identifier, parts, t):
-        if parts[0] in ["ROKET", "YUK", "GOREVYUKU"]:
-            parts = parts[1:]
-
+    def on_parsed_data(self, identifier: str, packet: dict, t: float):
         if identifier == "rocket":
             try:
-                if len(parts) > 0:
-                    try:
-                        v = float(parts[0])
-                        self.rocket_labels["İrtifa (m)"].setText(parts[0])
-                        self.r_alt.append(v)
-                        self.r_t_alt.append(t)
-                    except Exception: pass
-                if len(parts) > 1:
-                    try:
-                        v = float(parts[1])
-                        self.rocket_labels["Hız (m/s)"].setText(parts[1])
-                        self.r_vel.append(v)
-                        self.r_t_vel.append(t)
-                    except Exception: pass
-                if len(parts) > 2:
-                    try:
-                        v = float(parts[2])
-                        self.rocket_labels["İvme (g)"].setText(parts[2])
-                        self.r_acc.append(v)
-                        self.r_t_acc.append(t)
-                    except Exception: pass
-                if len(parts) > 3: 
-                    self.rocket_labels["Durum"].setText(parts[3])
-                if len(parts) > 4: 
-                    gps_str = parts[4]
-                    self.rocket_labels["GPS"].setText(gps_str)
-                    self.process_gps(gps_str, target="rocket")
-                if len(parts) > 7:
-                    try:
-                        roll = float(parts[5])
-                        pitch = float(parts[6])
-                        yaw = float(parts[7])
-                        self.rocket_labels["Avionik (R,P,Y)"].setText(f"{roll:.1f}, {pitch:.1f}, {yaw:.1f}")
-                        self.gl_widget.set_angles(roll, pitch, yaw)
-                    except ValueError: pass
-            except Exception: pass
+                self.rocket_labels["İrtifa (m)"].setText(f"{packet['irtifa']:.1f}")
+                self.r_alt.append(packet['irtifa']); self.r_t_alt.append(t)
+
+                self.rocket_labels["Dikey Hız (m/s)"].setText(f"{packet['dikeyHiz']:.2f}")
+                self.r_vel.append(packet['dikeyHiz']); self.r_t_vel.append(t)
+
+                self.rocket_labels["İvme Z (m/s²)"].setText(f"{packet['ivmeZ']:.2f}")
+                self.r_acc.append(packet['ivmeZ']); self.r_t_acc.append(t)
+
+                self.rocket_labels["Eğim Açısı (°)"].setText(f"{packet['eglimAcisi']:.1f}")
+                self.rocket_labels["Uçuş Durumu"].setText(DURUM_ETIKET.get(packet['ucus_durumu'], '?'))
+                self.rocket_labels["GPS"].setText(f"{packet['gpsEnlem']:.5f}, {packet['gpsBoylam']:.5f}")
+                self.rocket_labels["Aviyonik (R,P,Y)"].setText(
+                    f"{packet['roll']:.1f}, {packet['pitch']:.1f}, {packet['yaw']:.1f}")
+                self.rocket_labels["Basınç (Pa)"].setText(f"{packet['basinc']:.0f}")
+                self.rocket_labels["Sıcaklık (°C)"].setText(f"{packet['bmeSicaklik']:.1f}")
+                self.rocket_labels["Nem (%)"].setText(f"{packet['nem']:.1f}")
+                self.rocket_labels["Fünye 1"].setText("ATEŞLENDI ✓" if packet['ayrilma1_durum'] else "Pasif")
+                self.rocket_labels["Fünye 2"].setText("ATEŞLENDI ✓" if packet['ayrilma2_durum'] else "Pasif")
+
+                self.gl_widget.set_angles(packet['roll'], packet['pitch'], packet['yaw'])
+                if packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0:
+                    self.web_view.page().runJavaScript(
+                        f"updateRocket({packet['gpsEnlem']}, {packet['gpsBoylam']});")
+            except Exception as e:
+                self.append_text(f'<span style="color:#F44336;">[PARSE HATASI] {e}</span>')
 
         elif identifier == "payload":
             try:
-                if len(parts) > 0:
-                    try:
-                        v = float(parts[0])
-                        self.payload_labels["İrtifa (m)"].setText(parts[0])
-                        self.p_alt.append(v)
-                        self.p_t_alt.append(t)
-                    except Exception: pass
-                if len(parts) > 1:
-                    try:
-                        v = float(parts[1])
-                        self.payload_labels["Sıcaklık (°C)"].setText(parts[1])
-                        self.p_temp.append(v)
-                        self.p_t_temp.append(t)
-                    except Exception: pass
-                if len(parts) > 2:
-                    try:
-                        v = float(parts[2])
-                        self.payload_labels["Basınç (Pa)"].setText(parts[2])
-                        self.p_press.append(v)
-                        self.p_t_press.append(t)
-                    except Exception: pass
-                if len(parts) > 3: 
-                    self.payload_labels["Durum"].setText(parts[3])
-                if len(parts) > 4: 
-                    self.payload_labels["Nem (%)"].setText(parts[4])
-                if len(parts) > 5:
-                    gps_str = parts[5]
-                    self.payload_labels["GPS"].setText(gps_str)
-                    self.process_gps(gps_str, target="payload")
-            except Exception: pass
+                self.payload_labels["İrtifa (m)"].setText(f"{packet['irtifa']:.1f}")
+                self.p_alt.append(packet['irtifa']); self.p_t_alt.append(t)
+
+                self.payload_labels["Dikey Hız (m/s)"].setText(f"{packet['dikeyHiz']:.2f}")
+
+                self.payload_labels["Sıcaklık (°C)"].setText(f"{packet['bmeSicaklik']:.1f}")
+                self.p_temp.append(packet['bmeSicaklik']); self.p_t_temp.append(t)
+
+                self.payload_labels["Basınç (Pa)"].setText(f"{packet['basinc']:.0f}")
+                self.p_press.append(packet['basinc']); self.p_t_press.append(t)
+
+                self.payload_labels["Nem (%)"].setText(f"{packet['nem']:.1f}")
+                self.payload_labels["GPS"].setText(f"{packet['gpsEnlem']:.5f}, {packet['gpsBoylam']:.5f}")
+                self.payload_labels["Uçuş Durumu"].setText(DURUM_ETIKET.get(packet['ucus_durumu'], '?'))
+                self.payload_labels["Fünye 1"].setText("ATEŞLENDI ✓" if packet['ayrilma1_durum'] else "Pasif")
+                self.payload_labels["Fünye 2"].setText("ATEŞLENDI ✓" if packet['ayrilma2_durum'] else "Pasif")
+
+                if packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0:
+                    self.web_view.page().runJavaScript(
+                        f"updatePayload({packet['gpsEnlem']}, {packet['gpsBoylam']});")
+            except Exception as e:
+                self.append_text(f'<span style="color:#F44336;">[PAYLOAD PARSE HATASI] {e}</span>')
+
+
 
     def on_sys_error(self, identifier, err_msg):
         self.append_text(f'<span style="color:#F44336; font-weight:bold;">[HATA-{identifier.upper()}] {err_msg}</span>')
-
-    def process_gps(self, gps_str, target="rocket"):
-        for char in ['|', ';', ':']:
-            if char in gps_str:
-                coords = gps_str.split(char)
-                if len(coords) >= 2:
-                    try:
-                        lat, lon = float(coords[0].strip()), float(coords[1].strip())
-                        if target == "rocket":
-                            self.web_view.page().runJavaScript(f"updateRocket({lat}, {lon});")
-                        elif target == "payload":
-                            self.web_view.page().runJavaScript(f"updatePayload({lat}, {lon});")
-                    except ValueError: pass
-                break
 
     def update_plots(self):
         try:
