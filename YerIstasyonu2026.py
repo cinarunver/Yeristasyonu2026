@@ -746,6 +746,13 @@ class SerialViewerApp(QMainWindow):
                 if packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0:
                     self.web_view.page().runJavaScript(
                         f"updateRocket({packet['gpsEnlem']}, {packet['gpsBoylam']});")
+                
+                # Terminale parse edilmiş özeti bas
+                summary = (f"Alt:{packet['irtifa']:.1f}m | Hiz:{packet['dikeyHiz']:.1f}m/s | "
+                           f"Durum:{DURUM_ETIKET.get(packet['ucus_durumu'],'?')} | "
+                           f"GPS:{packet['gpsEnlem']:.4f},{packet['gpsBoylam']:.4f}")
+                self.append_text(f'<span style="color:#8BC34A;">  └─ [PARSE] {summary}</span>')
+
             except Exception as e:
                 self.append_text(f'<span style="color:#F44336;">[PARSE HATASI] {e}</span>')
 
@@ -771,6 +778,12 @@ class SerialViewerApp(QMainWindow):
                 if packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0:
                     self.web_view.page().runJavaScript(
                         f"updatePayload({packet['gpsEnlem']}, {packet['gpsBoylam']});")
+                
+                # Terminale parse edilmiş özeti bas
+                summary = (f"Alt:{packet['irtifa']:.1f}m | Sic:{packet['bmeSicaklik']:.1f}°C | "
+                           f"GPS:{packet['gpsEnlem']:.4f},{packet['gpsBoylam']:.4f}")
+                self.append_text(f'<span style="color:#CDDC39;">  └─ [PARSE] {summary}</span>')
+
             except Exception as e:
                 self.append_text(f'<span style="color:#F44336;">[PAYLOAD PARSE HATASI] {e}</span>')
 
