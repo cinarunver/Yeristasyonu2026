@@ -1,4 +1,9 @@
 # ==============================================================================
+# TODO LİSTESİ:
+# 1. Hakem Yer İstasyonu Entegrasyonu (Hakem bilgisayarına COMPORT üzerinden veri gönderme)
+# 2. Lokal Loglama (Gelen verilerin CSV/TXT olarak kaydedilmesi)
+# 3. Parsing kısmının son hale göre güncellenmesi 
+# ==============================================================================
 # YER İSTASYONU v3.0 — FRAMED BINARY TELEMETRİ PROTOKOLü
 # ESP32 (UcusYazilimi2026) → E32-433T30D LoRa / TTL → Bu uygulama
 # Protokol: [0xAA][0x55][LEN=71][TelemetryPacket 71B][CRC16_HI][CRC16_LO]
