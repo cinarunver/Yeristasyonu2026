@@ -190,10 +190,7 @@ class SerialWorker(QThread):
                         buf = bytearray()
                     # SYNC arayıp çerçeve işle
                     while len(buf) >= FRAME_SIZE:
-                        idx = -1
-                        for i in range(len(buf) - 1):
-                            if buf[i] == SYNC_1 and buf[i+1] == SYNC_2:
-                                idx = i; break
+                        idx = buf.find(bytes([SYNC_1, SYNC_2]))
                         if idx == -1:
                             buf = buf[-1:]; break
                         if idx > 0:
@@ -542,6 +539,7 @@ class SerialViewerApp(QMainWindow):
         left_layout.addWidget(QLabel("Terminal Log:"))
         self.text_area = QTextEdit()
         self.text_area.setReadOnly(True)
+        self.text_area.document().setMaximumBlockCount(1000)
         self.text_area.setStyleSheet("background-color: #121212; color: #D4D4D4; font-family: monospace; font-size: 12px;")
         left_layout.addWidget(self.text_area)
         
@@ -816,11 +814,10 @@ class SerialViewerApp(QMainWindow):
             pass
 
     def append_text(self, text):
-        formatted_text = text.replace('\n', '<br/>').replace('\r', '') + '<br/>'
+        formatted_text = text.replace('\n', '<br/>').replace('\r', '')
         scrollbar = self.text_area.verticalScrollBar()
         is_scrolled_to_bottom = scrollbar.value() == scrollbar.maximum()
-        self.text_area.moveCursor(self.text_area.textCursor().MoveOperation.End)
-        self.text_area.insertHtml(formatted_text)
+        self.text_area.append(formatted_text)
         if is_scrolled_to_bottom:
             scrollbar.setValue(scrollbar.maximum())
 

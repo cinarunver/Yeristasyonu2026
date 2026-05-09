@@ -37,6 +37,7 @@ Toplam: 2 + 1 + 71 + 2 = 76 byte/çerçeve
 ```
 
 ### CRC16-CCITT
+
 - **Polinom:** 0x1021  
 - **Başlangıç değeri:** 0xFFFF  
 - **Hesaplama kapsamı:** Yalnızca 71 byte `TelemetryPacket` payload'ı (SYNC ve LEN dahil değil)
@@ -68,10 +69,7 @@ struct TelemetryPacket {
     float    roll;            // [6]  derece — Euler roll (Kalman)
     float    pitch;           // [7]  derece — Euler pitch
     float    yaw;             // [8]  derece — Euler yaw
-    float    basinc;          // [9]  Pascal — Atmosferik basınç (Kalman)
-    float    bmeSicaklik;     // [10] °C     — Hava sıcaklığı (Kalman)
     float    irtifa;          // [11] metre  — Ground-relative irtifa (Kalman)
-    float    nem;             // [12] %      — Bağıl nem (Kalman)
     float    dikeyHiz;        // [13] m/s    — Dikey hız (irtifadan türev)
     float    eglimAcisi;      // [14] derece — Yerden eğim (0° = tam dik)
     float    gpsEnlem;        // [15] decimal degrees
@@ -99,18 +97,15 @@ struct TelemetryPacket {
 | roll           | float32 LE | 4      | 24     |
 | pitch          | float32 LE | 4      | 28     |
 | yaw            | float32 LE | 4      | 32     |
-| basinc         | float32 LE | 4      | 36     |
-| bmeSicaklik    | float32 LE | 4      | 40     |
-| irtifa         | float32 LE | 4      | 44     |
-| nem            | float32 LE | 4      | 48     |
-| dikeyHiz       | float32 LE | 4      | 52     |
-| eglimAcisi     | float32 LE | 4      | 56     |
-| gpsEnlem       | float32 LE | 4      | 60     |
-| gpsBoylam      | float32 LE | 4      | 64     |
-| ayrilma1_durum | uint8      | 1      | 68     |
-| ayrilma2_durum | uint8      | 1      | 69     |
-| ucus_durumu    | uint8      | 1      | 70     |
-| **PAYLOAD TOPLAM** |        | **71** |        |
+| irtifa         | float32 LE | 4      | 36     |
+| dikeyHiz       | float32 LE | 4      | 40     |
+| eglimAcisi     | float32 LE | 4      | 44     |
+| gpsEnlem       | float32 LE | 4      | 48     |
+| gpsBoylam      | float32 LE | 4      | 52     |
+| ayrilma1_durum | uint8      | 1      | 56     |
+| ayrilma2_durum | uint8      | 1      | 57     |
+| ucus_durumu    | uint8      | 1      | 58     |
+| **PAYLOAD TOPLAM** |        | **59** |        |
 
 ---
 
@@ -134,9 +129,9 @@ struct TelemetryPacket {
 import struct
 
 PACKET_FORMAT = '<17f3B'                       # little-endian
-PACKET_SIZE   = struct.calcsize(PACKET_FORMAT) # 71 byte
+PACKET_SIZE   = struct.calcsize(PACKET_FORMAT) # 59 byte
 SYNC_1, SYNC_2 = 0xAA, 0x55
-FRAME_SIZE    = 2 + 1 + PACKET_SIZE + 2        # 76 byte
+FRAME_SIZE    = 2 + 1 + PACKET_SIZE + 2        # 64 byte
 ```
 
 ### Çerçeve Ayrıştırma
@@ -203,10 +198,7 @@ void Task2code(void *pvParameters) {
 | Sensör Grubu            | Ölçüm Hatası | Tahmin Hatası | Süreç Gürültüsü |
 |-------------------------|-------------|--------------|-----------------|
 | İvme / Jiroskop / Euler | 0.1         | 0.1          | 0.01            |
-| Basınç                  | 2.0         | 2.0          | 0.1             |
-| Sıcaklık                | 0.5         | 0.5          | 0.01            |
 | İrtifa                  | 1.5         | 1.5          | 0.1             |
-| Nem                     | 1.0         | 1.0          | 0.1             |
 
 ---
 
@@ -217,3 +209,4 @@ void Task2code(void *pvParameters) {
 | v1.0     | 2026-04-20 | İlk sürüm — CSV/String format (`ROKET,...`)                             |
 | v2.0     | 2026-04-22 | Ham binary `TelemetryPacket` struct, Kalman, state machine              |
 | v3.0     | 2026-04-25 | **Framed Protocol:** SYNC(0xAA 0x55) + CRC16-CCITT, E32-433T30D desteği, LoRa 10 Hz rate limiting |
+| v4.0     | 2026-04-27 | **Framed Protocol:** SYNC(0xAA 0x55) + CRC16-CCITT, E32-433T30D desteği, LoRa 10 Hz
