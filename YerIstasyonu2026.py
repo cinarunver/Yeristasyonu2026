@@ -20,10 +20,15 @@ import serial.tools.list_ports
 from collections import deque
 
 # --- PAKET SABİTLERİ ---
-PACKET_FORMAT = '<17f3B'                       # little-endian: 17 float + 3 uint8
-PACKET_SIZE   = struct.calcsize(PACKET_FORMAT) # 71 byte
+ROCKET_PACKET_FORMAT = '<14f3B'
+ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 59 byte
+ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 64 byte
+
+PAYLOAD_PACKET_FORMAT = '<17f3B'
+PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 71 byte
+PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 76 byte
+
 SYNC_1, SYNC_2 = 0xAA, 0x55
-FRAME_SIZE    = 2 + 1 + PACKET_SIZE + 2        # 76 byte
 
 DURUM_ETIKET = {
     0: 'HAZIR',
@@ -42,15 +47,34 @@ def crc16_ccitt(data: bytes) -> int:
             crc &= 0xFFFF
     return crc
 
-def parse_frame(raw: bytes):
-    """76 byte çerçeveyi ayrıştırır. Geçersizse None döner."""
-    if len(raw) != FRAME_SIZE: return None
+def parse_rocket_frame(raw: bytes):
+    if len(raw) != ROCKET_FRAME_SIZE: return None
     if raw[0] != SYNC_1 or raw[1] != SYNC_2: return None
-    if raw[2] != PACKET_SIZE: return None
-    payload = raw[3:3 + PACKET_SIZE]
-    crc_recv = (raw[3 + PACKET_SIZE] << 8) | raw[3 + PACKET_SIZE + 1]
+    if raw[2] != ROCKET_PACKET_SIZE: return None
+    payload = raw[3:3 + ROCKET_PACKET_SIZE]
+    crc_recv = (raw[3 + ROCKET_PACKET_SIZE] << 8) | raw[3 + ROCKET_PACKET_SIZE + 1]
     if crc16_ccitt(payload) != crc_recv: return None
-    v = struct.unpack(PACKET_FORMAT, payload)
+    v = struct.unpack(ROCKET_PACKET_FORMAT, payload)
+    return {
+        'ivmeX': v[0],  'ivmeY': v[1],  'ivmeZ': v[2],
+        'gyroX': v[3],  'gyroY': v[4],  'gyroZ': v[5],
+        'roll':  v[6],  'pitch': v[7],  'yaw':   v[8],
+        'irtifa': v[9],
+        'dikeyHiz': v[10], 'eglimAcisi': v[11],
+        'gpsEnlem': v[12], 'gpsBoylam': v[13],
+        'ayrilma1_durum': bool(v[14]),
+        'ayrilma2_durum': bool(v[15]),
+        'ucus_durumu':    v[16],
+    }
+
+def parse_payload_frame(raw: bytes):
+    if len(raw) != PAYLOAD_FRAME_SIZE: return None
+    if raw[0] != SYNC_1 or raw[1] != SYNC_2: return None
+    if raw[2] != PAYLOAD_PACKET_SIZE: return None
+    payload = raw[3:3 + PAYLOAD_PACKET_SIZE]
+    crc_recv = (raw[3 + PAYLOAD_PACKET_SIZE] << 8) | raw[3 + PAYLOAD_PACKET_SIZE + 1]
+    if crc16_ccitt(payload) != crc_recv: return None
+    v = struct.unpack(PAYLOAD_PACKET_FORMAT, payload)
     return {
         'ivmeX': v[0],  'ivmeY': v[1],  'ivmeZ': v[2],
         'gyroX': v[3],  'gyroY': v[4],  'gyroZ': v[5],
@@ -62,10 +86,37 @@ def parse_frame(raw: bytes):
         'ayrilma2_durum': bool(v[18]),
         'ucus_durumu':    v[19],
     }
+
+def parse_string_frame(text: str):
+    """'Irtifa: 123.45 | Vz: 12.34 | Eglim: 45.67 | Pitch: 45.67 | Durum: 1' formatındaki stringi ayrıştırır."""
+    try:
+        if "Irtifa:" not in text or "Vz:" not in text or "Durum:" not in text:
+            return None
+        parts = text.split('|')
+        irtifa = float(parts[0].split(':')[1].strip())
+        vz = float(parts[1].split(':')[1].strip())
+        eglim = float(parts[2].split(':')[1].strip())
+        pitch = float(parts[3].split(':')[1].strip())
+        durum = int(parts[4].split(':')[1].strip())
+        
+        return {
+            'ivmeX': 0.0, 'ivmeY': 0.0, 'ivmeZ': 0.0,
+            'gyroX': 0.0, 'gyroY': 0.0, 'gyroZ': 0.0,
+            'roll': 0.0, 'pitch': pitch, 'yaw': 0.0,
+            'irtifa': irtifa,
+            'dikeyHiz': vz, 'eglimAcisi': eglim,
+            'gpsEnlem': 0.0, 'gpsBoylam': 0.0,
+            'ayrilma1_durum': False,
+            'ayrilma2_durum': False,
+            'ucus_durumu': durum,
+        }
+    except Exception:
+        return None
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QComboBox, QPushButton, 
                              QTextEdit, QMessageBox, QGroupBox, QFormLayout, 
-                             QSplitter, QTabWidget)
+                             QSplitter, QTabWidget, QFileDialog, QRadioButton, 
+                             QLineEdit, QButtonGroup)
 from PyQt6.QtCore import pyqtSignal, QObject, QTimer, Qt, QThread, QUrl
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -159,12 +210,13 @@ class SerialWorker(QThread):
     error_signal = pyqtSignal(str, str)
     disconnected_signal = pyqtSignal(str)
 
-    def __init__(self, port, baudrate, identifier, start_time):
+    def __init__(self, port, baudrate, identifier, start_time, mode="binary"):
         super().__init__()
         self.port = port
         self.baudrate = baudrate
         self.identifier = identifier
         self.start_time = start_time
+        self.mode = mode
         self.is_running = True
         self.serial_conn = None
 
@@ -184,26 +236,46 @@ class SerialWorker(QThread):
             try:
                 waiting = self.serial_conn.in_waiting
                 if waiting > 0:
-                    buf.extend(self.serial_conn.read(waiting))
-                    # Buffer overflow koruması
-                    if len(buf) > FRAME_SIZE * 10:
-                        buf = bytearray()
-                    # SYNC arayıp çerçeve işle
-                    while len(buf) >= FRAME_SIZE:
-                        idx = buf.find(bytes([SYNC_1, SYNC_2]))
-                        if idx == -1:
-                            buf = buf[-1:]; break
-                        if idx > 0:
-                            buf = buf[idx:]
-                        if len(buf) < FRAME_SIZE:
-                            break
-                        frame = bytes(buf[:FRAME_SIZE])
-                        buf   = buf[FRAME_SIZE:]
-                        packet = parse_frame(frame)
-                        if packet is not None:
-                            t = time.time() - self.start_time
-                            self.raw_data_signal.emit(self.identifier, frame.hex())
-                            self.parsed_data_signal.emit(self.identifier, packet, t)
+                    if self.mode == "binary":
+                        buf.extend(self.serial_conn.read(waiting))
+                        # Buffer overflow koruması
+                        max_frame = PAYLOAD_FRAME_SIZE * 10
+                        if len(buf) > max_frame:
+                            buf = bytearray()
+                        # SYNC arayıp çerçeve işle
+                        frame_size = ROCKET_FRAME_SIZE if self.identifier == "rocket" else PAYLOAD_FRAME_SIZE
+                        while len(buf) >= frame_size:
+                            idx = buf.find(bytes([SYNC_1, SYNC_2]))
+                            if idx == -1:
+                                buf = buf[-1:]; break
+                            if idx > 0:
+                                buf = buf[idx:]
+                            if len(buf) < frame_size:
+                                break
+                            frame = bytes(buf[:frame_size])
+                            buf   = buf[frame_size:]
+                            if self.identifier == "rocket":
+                                packet = parse_rocket_frame(frame)
+                            else:
+                                packet = parse_payload_frame(frame)
+                            
+                            if packet is not None:
+                                t = time.time() - self.start_time
+                                self.raw_data_signal.emit(self.identifier, frame.hex())
+                                self.parsed_data_signal.emit(self.identifier, packet, t)
+                    else:
+                        line = self.serial_conn.readline()
+                        if line:
+                            try:
+                                text = line.decode('utf-8', errors='replace').strip()
+                                if text:
+                                    self.raw_data_signal.emit(self.identifier, text)
+                                    packet = parse_string_frame(text)
+                                    if packet:
+                                        t = time.time() - self.start_time
+                                        self.parsed_data_signal.emit(self.identifier, packet, t)
+                            except:
+                                pass
                 else:
                     self.msleep(5)
             except Exception as e:
@@ -214,37 +286,106 @@ class SerialWorker(QThread):
     def run_simulator(self):
         alt, vel, acc = 0.0, 0.0, 0.0
         r, p, yaw_a = 0.0, 0.0, 0.0
-        lat, lon = 38.835, 33.393
+        lat, lon = 41.0082, 28.9784 # İstanbul
         ucus_durumu = 0
+        ayrilma1 = 0
+        ayrilma2 = 0
+        dt = 0.1
 
         while self.is_running:
             t = time.time() - self.start_time
-            r    = (r + random.uniform(-2, 2)) % 360
-            p    = (p + random.uniform(-1, 1)) % 360
-            yaw_a = (yaw_a + random.uniform(-0.5, 0.5)) % 360
-            acc  = 30.0 if t < 5 else 0.0
-            vel  = max(0.0, vel + (acc - 9.8) * 0.1)
-            alt  = max(0.0, alt + vel * 0.1)
-            lat += 0.00005; lon += 0.00005
-            if ucus_durumu == 0 and t > 2: ucus_durumu = 1
-            if ucus_durumu == 1 and vel < 0: ucus_durumu = 2
+            
+            # --- FİZİK MOTORU (Hedef: ~3800m Apogee) ---
+            if t < 3.0:
+                ucus_durumu = 0
+                acc = 0.0 + random.uniform(-0.02, 0.02)
+                vel = 0.0
+                alt = 0.0
+            elif t < 8.3:
+                ucus_durumu = 1
+                acc = 5.2 + random.uniform(-0.2, 0.2)
+                vel += (acc * 9.81) * dt
+                alt += vel * dt
+                lat += 0.00005
+                lon += 0.00002
+            elif vel > 0:
+                ucus_durumu = 1
+                acc = -1.0 + random.uniform(-0.05, 0.05)
+                vel -= 9.81 * dt + (0.002 * vel**2 * dt)
+                alt += vel * dt
+                if vel <= 0:
+                    ucus_durumu = 2
+                    ayrilma1 = 1
+            elif alt > 600:
+                ucus_durumu = 2
+                vel = -25.0 + random.uniform(-1.0, 1.0)
+                alt += vel * dt
+                acc = -0.1
+                if alt <= 600:
+                    ucus_durumu = 3
+                    ayrilma2 = 1
+            elif alt > 0:
+                ucus_durumu = 3
+                vel = -5.0 + random.uniform(-0.5, 0.5)
+                alt += vel * dt
+                acc = -0.05
+                if alt < 0: alt = 0
+            else:
+                ucus_durumu = 4
+                vel = 0.0
+                alt = 0.0
+                acc = 0.0
 
-            payload = struct.pack(PACKET_FORMAT,
-                random.uniform(-1,1), random.uniform(-1,1), acc,
-                random.uniform(-.1,.1), random.uniform(-.1,.1), random.uniform(-.1,.1),
-                r, p, yaw_a,
-                101325.0 - alt * 12.0, 25.0 - alt * 0.006, alt,
-                45.0 + random.uniform(-1,1),
-                vel, abs(p % 90),
-                lat, lon,
-                0, 0, ucus_durumu
-            )
-            crc = crc16_ccitt(payload)
-            frame = bytes([SYNC_1, SYNC_2, PACKET_SIZE]) + payload + bytes([(crc>>8)&0xFF, crc&0xFF])
-            packet = parse_frame(frame)
-            if packet:
-                self.raw_data_signal.emit(self.identifier, frame.hex())
-                self.parsed_data_signal.emit(self.identifier, packet, t)
+            # Fıldır Fıldır Dönme
+            r = (r + random.uniform(30.0, 90.0)) % 360 
+            p = (p + random.uniform(15.0, 45.0)) % 360 
+            yaw_a = (yaw_a + random.uniform(20.0, 60.0)) % 360
+            
+            sent_alt = alt + random.uniform(-800.0, 800.0)
+
+            if self.identifier == "rocket":
+                payload = struct.pack(ROCKET_PACKET_FORMAT,
+                    random.uniform(-0.1,0.1), random.uniform(-0.1,0.1), acc,
+                    random.uniform(-1,1), random.uniform(-1,1), random.uniform(-1,1),
+                    r, p, yaw_a,
+                    sent_alt, vel, abs(p % 90),
+                    lat, lon,
+                    ayrilma1, ayrilma2, ucus_durumu
+                )
+                crc = crc16_ccitt(payload)
+                if self.mode == "binary":
+                    frame = bytes([SYNC_1, SYNC_2, ROCKET_PACKET_SIZE]) + payload + bytes([(crc>>8)&0xFF, crc&0xFF])
+                    packet = parse_rocket_frame(frame)
+                    if packet:
+                        self.raw_data_signal.emit(self.identifier, frame.hex())
+                        self.parsed_data_signal.emit(self.identifier, packet, t)
+                else:
+                    text = f"Irtifa: {sent_alt:.2f} | Vz: {vel:.2f} | Eglim: {abs(p % 90):.2f} | Pitch: {p:.2f} | Durum: {ucus_durumu}"
+                    self.raw_data_signal.emit(self.identifier, text)
+                    packet = parse_string_frame(text)
+                    if packet:
+                        self.parsed_data_signal.emit(self.identifier, packet, t)
+            else:
+                payload = struct.pack(PAYLOAD_PACKET_FORMAT,
+                    random.uniform(-1,1), random.uniform(-1,1), acc,
+                    random.uniform(-1,1), random.uniform(-1,1), random.uniform(-1,1),
+                    r, p, yaw_a,
+                    101325.0 - sent_alt * 12.0, 25.0 - sent_alt * 0.006, sent_alt,
+                    45.0 + random.uniform(-1,1),
+                    vel, abs(p % 90),
+                    lat, lon,
+                    ayrilma1, ayrilma2, ucus_durumu
+                )
+                crc = crc16_ccitt(payload)
+                if self.mode == "binary":
+                    frame = bytes([SYNC_1, SYNC_2, PAYLOAD_PACKET_SIZE]) + payload + bytes([(crc>>8)&0xFF, crc&0xFF])
+                    packet = parse_payload_frame(frame)
+                    if packet:
+                        self.raw_data_signal.emit(self.identifier, frame.hex())
+                        self.parsed_data_signal.emit(self.identifier, packet, t)
+                else:
+                    text = f"Irtifa: {sent_alt:.2f} | Sic: {25.0 - sent_alt * 0.006:.1f} | Durum: {ucus_durumu}"
+                    self.raw_data_signal.emit(self.identifier, text)
             self.msleep(100)
 
     def stop(self):
@@ -395,20 +536,22 @@ class SerialViewerApp(QMainWindow):
         self.rocket_worker = None
         self.payload_worker = None
 
-        self.MAX_POINTS = 300
-        self.r_t_alt = deque(maxlen=self.MAX_POINTS)
-        self.r_alt = deque(maxlen=self.MAX_POINTS)
-        self.r_t_vel = deque(maxlen=self.MAX_POINTS)
-        self.r_vel = deque(maxlen=self.MAX_POINTS)
-        self.r_t_acc = deque(maxlen=self.MAX_POINTS)
-        self.r_acc = deque(maxlen=self.MAX_POINTS)
+        self.r_t_alt = []
+        self.r_alt = []
+        self.r_t_vel = []
+        self.r_vel = []
+        self.r_t_acc = []
+        self.r_acc = []
         
-        self.p_t_alt = deque(maxlen=self.MAX_POINTS)
-        self.p_alt = deque(maxlen=self.MAX_POINTS)
-        self.p_t_temp = deque(maxlen=self.MAX_POINTS)
-        self.p_temp = deque(maxlen=self.MAX_POINTS)
-        self.p_t_press = deque(maxlen=self.MAX_POINTS)
-        self.p_press = deque(maxlen=self.MAX_POINTS)
+        self.p_t_alt = []
+        self.p_alt = []
+        self.p_t_temp = []
+        self.p_temp = []
+        self.p_t_press = []
+        self.p_press = []
+
+        self.is_logging = False
+        self.log_file_path = ""
 
         self._setup_ui()
         self.refresh_ports()
@@ -420,11 +563,14 @@ class SerialViewerApp(QMainWindow):
     def _setup_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
+        main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(5, 5, 5, 5)
         
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
+        v_splitter = QSplitter(Qt.Orientation.Vertical)
+        main_layout.addWidget(v_splitter)
+        
+        h_splitter = QSplitter(Qt.Orientation.Horizontal)
+        v_splitter.addWidget(h_splitter)
         
         # 1. SOL PANEL
         left_widget = QWidget()
@@ -468,14 +614,9 @@ class SerialViewerApp(QMainWindow):
             "Dikey Hız (m/s)": QLabel("-"),
             "İvme Z (m/s²)":   QLabel("-"),
             "Eğim Açısı (°)":  QLabel("-"),
-            "Uçuş Durumu":    QLabel("-"),
+            "Durum":           QLabel("-"),
             "GPS":             QLabel("-"),
             "Aviyonik (R,P,Y)": QLabel("-"),
-            "Basınç (Pa)":     QLabel("-"),
-            "Sıcaklık (°C)":   QLabel("-"),
-            "Nem (%)":         QLabel("-"),
-            "Fünye 1":        QLabel("-"),
-            "Fünye 2":        QLabel("-"),
         }
         for key, lbl in self.rocket_labels.items():
             lbl.setStyleSheet("color: #2196F3; font-weight: bold; font-size: 15px;")
@@ -521,9 +662,7 @@ class SerialViewerApp(QMainWindow):
             "Basınç (Pa)":     QLabel("-"),
             "Nem (%)":         QLabel("-"),
             "GPS":             QLabel("-"),
-            "Uçuş Durumu":    QLabel("-"),
-            "Fünye 1":        QLabel("-"),
-            "Fünye 2":        QLabel("-"),
+            "Durum":           QLabel("-"),
         }
         for key, lbl in self.payload_labels.items():
             lbl.setStyleSheet("color: #FF9800; font-weight: bold; font-size: 15px;")
@@ -535,17 +674,7 @@ class SerialViewerApp(QMainWindow):
         payload_group.setLayout(pv_layout)
         left_layout.addWidget(payload_group)
         
-        # TERMİNAL
-        left_layout.addWidget(QLabel("Terminal Log:"))
-        self.text_area = QTextEdit()
-        self.text_area.setReadOnly(True)
-        self.text_area.document().setMaximumBlockCount(1000)
-        self.text_area.setStyleSheet("background-color: #121212; color: #D4D4D4; font-family: monospace; font-size: 12px;")
-        left_layout.addWidget(self.text_area)
-        
-        self.clear_btn = QPushButton("Terminali Temizle")
-        self.clear_btn.clicked.connect(self.text_area.clear)
-        left_layout.addWidget(self.clear_btn)
+        left_layout.addStretch()
 
         # =========================================================
         # 2. SAĞ PANEL (SEKMELER)
@@ -636,9 +765,74 @@ class SerialViewerApp(QMainWindow):
         t3d_layout.addWidget(self.gl_widget)
         self.tabs.addTab(self.tab_3d, "🎯 3D Aviyonik")
         
-        splitter.addWidget(left_widget)
-        splitter.addWidget(right_widget)
-        splitter.setSizes([380, 1540])
+        h_splitter.addWidget(left_widget)
+        h_splitter.addWidget(right_widget)
+        h_splitter.setSizes([380, 1540])
+
+        # 3. ALT PANEL (TERMİNAL VE LOG AYARLARI)
+        bottom_widget = QWidget()
+        bottom_layout = QHBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 3.1 Terminal
+        terminal_widget = QWidget()
+        terminal_layout = QVBoxLayout(terminal_widget)
+        terminal_layout.setContentsMargins(0, 0, 0, 0)
+        
+        terminal_layout.addWidget(QLabel("Terminal Log:"))
+        self.text_area = QTextEdit()
+        self.text_area.setReadOnly(True)
+        self.text_area.document().setMaximumBlockCount(1000)
+        self.text_area.setStyleSheet("background-color: #121212; color: #D4D4D4; font-family: monospace; font-size: 12px;")
+        terminal_layout.addWidget(self.text_area)
+        
+        self.clear_btn = QPushButton("Terminali Temizle")
+        self.clear_btn.clicked.connect(self.text_area.clear)
+        terminal_layout.addWidget(self.clear_btn)
+        
+        # 3.2 Log Ayarları
+        log_group = QGroupBox("💾 Log Kaydı Ayarları")
+        log_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 15px; }")
+        log_layout = QVBoxLayout()
+        
+        file_layout = QHBoxLayout()
+        self.log_path_input = QLineEdit()
+        self.log_path_input.setReadOnly(True)
+        self.log_path_input.setPlaceholderText("Log dosyası seçin...")
+        self.log_browse_btn = QPushButton("Gözat...")
+        self.log_browse_btn.clicked.connect(self.browse_log_file)
+        file_layout.addWidget(self.log_path_input)
+        file_layout.addWidget(self.log_browse_btn)
+        log_layout.addLayout(file_layout)
+        
+        format_layout = QHBoxLayout()
+        self.rb_parsed = QRadioButton("Parsed (Anlamlı Veri)")
+        self.rb_raw = QRadioButton("Raw (String/Hex)")
+        self.rb_parsed.setChecked(True)
+        self.rb_parsed.toggled.connect(self.change_program_mode)
+        
+        self.log_format_group = QButtonGroup()
+        self.log_format_group.addButton(self.rb_parsed)
+        self.log_format_group.addButton(self.rb_raw)
+        format_layout.addWidget(self.rb_parsed)
+        format_layout.addWidget(self.rb_raw)
+        log_layout.addLayout(format_layout)
+        
+        self.log_active_btn = QPushButton("▶ Log Kaydını Başlat")
+        self.log_active_btn.setCheckable(True)
+        self.log_active_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
+        self.log_active_btn.toggled.connect(self.toggle_logging)
+        log_layout.addWidget(self.log_active_btn)
+        
+        log_layout.addStretch()
+        log_group.setLayout(log_layout)
+        log_group.setFixedWidth(350)
+        
+        bottom_layout.addWidget(terminal_widget)
+        bottom_layout.addWidget(log_group)
+
+        v_splitter.addWidget(bottom_widget)
+        v_splitter.setSizes([800, 280])
 
     def refresh_ports(self):
         curr_rocket = self.rocket_cb.currentText()
@@ -661,7 +855,8 @@ class SerialViewerApp(QMainWindow):
         baudrate = self.rocket_baud.currentText()
         if not port: return
         
-        self.rocket_worker = SerialWorker(port, baudrate, "rocket", self.start_time)
+        mode = "binary" if self.rb_parsed.isChecked() else "string"
+        self.rocket_worker = SerialWorker(port, baudrate, "rocket", self.start_time, mode)
         self.rocket_worker.raw_data_signal.connect(self.on_raw_data)
         self.rocket_worker.parsed_data_signal.connect(self.on_parsed_data)
         self.rocket_worker.error_signal.connect(self.on_sys_error)
@@ -681,7 +876,8 @@ class SerialViewerApp(QMainWindow):
         baudrate = self.payload_baud.currentText()
         if not port: return
         
-        self.payload_worker = SerialWorker(port, baudrate, "payload", self.start_time)
+        mode = "binary" if self.rb_parsed.isChecked() else "string"
+        self.payload_worker = SerialWorker(port, baudrate, "payload", self.start_time, mode)
         self.payload_worker.raw_data_signal.connect(self.on_raw_data)
         self.payload_worker.parsed_data_signal.connect(self.on_parsed_data)
         self.payload_worker.error_signal.connect(self.on_sys_error)
@@ -717,6 +913,9 @@ class SerialViewerApp(QMainWindow):
             self.on_raw_data("payload", "=== BAĞLANTI KESİLDİ ===")
 
     def on_raw_data(self, identifier, raw_str):
+        if self.is_logging and self.rb_raw.isChecked():
+            self.write_log(f"[{identifier.upper()}] RAW: {raw_str}")
+            
         if identifier == "rocket":
             self.append_text(f'<span style="color:#2196F3; font-weight:bold;">[ROKET]</span> {raw_str}')
         else:
@@ -735,15 +934,10 @@ class SerialViewerApp(QMainWindow):
                 self.r_acc.append(packet['ivmeZ']); self.r_t_acc.append(t)
 
                 self.rocket_labels["Eğim Açısı (°)"].setText(f"{packet['eglimAcisi']:.1f}")
-                self.rocket_labels["Uçuş Durumu"].setText(DURUM_ETIKET.get(packet['ucus_durumu'], '?'))
+                self.rocket_labels["Durum"].setText(DURUM_ETIKET.get(packet['ucus_durumu'], '?'))
                 self.rocket_labels["GPS"].setText(f"{packet['gpsEnlem']:.5f}, {packet['gpsBoylam']:.5f}")
                 self.rocket_labels["Aviyonik (R,P,Y)"].setText(
                     f"{packet['roll']:.1f}, {packet['pitch']:.1f}, {packet['yaw']:.1f}")
-                self.rocket_labels["Basınç (Pa)"].setText(f"{packet['basinc']:.0f}")
-                self.rocket_labels["Sıcaklık (°C)"].setText(f"{packet['bmeSicaklik']:.1f}")
-                self.rocket_labels["Nem (%)"].setText(f"{packet['nem']:.1f}")
-                self.rocket_labels["Fünye 1"].setText("ATEŞLENDI ✓" if packet['ayrilma1_durum'] else "Pasif")
-                self.rocket_labels["Fünye 2"].setText("ATEŞLENDI ✓" if packet['ayrilma2_durum'] else "Pasif")
 
                 self.gl_widget.set_angles(packet['roll'], packet['pitch'], packet['yaw'])
                 if packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0:
@@ -755,6 +949,8 @@ class SerialViewerApp(QMainWindow):
                            f"Durum:{DURUM_ETIKET.get(packet['ucus_durumu'],'?')} | "
                            f"GPS:{packet['gpsEnlem']:.4f},{packet['gpsBoylam']:.4f}")
                 self.append_text(f'<span style="color:#8BC34A;">  └─ [PARSE] {summary}</span>')
+                if self.is_logging and self.rb_parsed.isChecked():
+                    self.write_log(f"[ROKET] PARSED: {summary}")
 
             except Exception as e:
                 self.append_text(f'<span style="color:#F44336;">[PARSE HATASI] {e}</span>')
@@ -774,9 +970,7 @@ class SerialViewerApp(QMainWindow):
 
                 self.payload_labels["Nem (%)"].setText(f"{packet['nem']:.1f}")
                 self.payload_labels["GPS"].setText(f"{packet['gpsEnlem']:.5f}, {packet['gpsBoylam']:.5f}")
-                self.payload_labels["Uçuş Durumu"].setText(DURUM_ETIKET.get(packet['ucus_durumu'], '?'))
-                self.payload_labels["Fünye 1"].setText("ATEŞLENDI ✓" if packet['ayrilma1_durum'] else "Pasif")
-                self.payload_labels["Fünye 2"].setText("ATEŞLENDI ✓" if packet['ayrilma2_durum'] else "Pasif")
+                self.payload_labels["Durum"].setText(DURUM_ETIKET.get(packet['ucus_durumu'], '?'))
 
                 if packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0:
                     self.web_view.page().runJavaScript(
@@ -786,11 +980,52 @@ class SerialViewerApp(QMainWindow):
                 summary = (f"Alt:{packet['irtifa']:.1f}m | Sic:{packet['bmeSicaklik']:.1f}°C | "
                            f"GPS:{packet['gpsEnlem']:.4f},{packet['gpsBoylam']:.4f}")
                 self.append_text(f'<span style="color:#CDDC39;">  └─ [PARSE] {summary}</span>')
+                if self.is_logging and self.rb_parsed.isChecked():
+                    self.write_log(f"[G.YÜKÜ] PARSED: {summary}")
 
             except Exception as e:
                 self.append_text(f'<span style="color:#F44336;">[PAYLOAD PARSE HATASI] {e}</span>')
 
 
+
+    def browse_log_file(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Log Dosyasını Kaydet", "", "Text Files (*.txt);;All Files (*)")
+        if file_path:
+            self.log_path_input.setText(file_path)
+            self.log_file_path = file_path
+
+    def toggle_logging(self, checked):
+        if checked:
+            if not self.log_file_path:
+                QMessageBox.warning(self, "Uyarı", "Lütfen önce bir log dosyası seçin!")
+                self.log_active_btn.setChecked(False)
+                return
+            self.is_logging = True
+            self.log_active_btn.setText("⏹ Log Kaydını Durdur")
+            self.log_active_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold; padding: 10px;")
+            self.append_text(f'<span style="color:#FFEB3B;">[LOG] Kayıt başladı: {self.log_file_path}</span>')
+        else:
+            self.is_logging = False
+            self.log_active_btn.setText("▶ Log Kaydını Başlat")
+            self.log_active_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
+            self.append_text('<span style="color:#FFEB3B;">[LOG] Kayıt durduruldu.</span>')
+
+    def write_log(self, data_str):
+        if not self.is_logging or not self.log_file_path:
+            return
+        try:
+            with open(self.log_file_path, "a", encoding="utf-8") as f:
+                f.write(data_str + "\n")
+        except Exception as e:
+            self.append_text(f'<span style="color:#F44336;">[LOG YAZMA HATASI] {e}</span>')
+
+    def change_program_mode(self):
+        mode = "binary" if self.rb_parsed.isChecked() else "string"
+        if self.rocket_worker:
+            self.rocket_worker.mode = mode
+        if self.payload_worker:
+            self.payload_worker.mode = mode
+        self.append_text(f'<span style="color:#00BCD4; font-weight:bold;">[MOD DEĞİŞTİ] Tüm program "{mode.upper()}" okuma moduna geçti.</span>')
 
     def on_sys_error(self, identifier, err_msg):
         self.append_text(f'<span style="color:#F44336; font-weight:bold;">[HATA-{identifier.upper()}] {err_msg}</span>')
