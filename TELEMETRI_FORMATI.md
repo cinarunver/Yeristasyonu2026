@@ -57,6 +57,9 @@ def crc16_ccitt(data: bytes) -> int:
 
 ## 3. TelemetryPacket Struct Tanımı
 
+> **DÜZELTME (2026-07-02):** `TelemetryPacket` **59 byte**'tır (14 float + 3 byte),
+> aşağıdaki "71 byte" ifadesi hatalıydı. Görev yükü ise apayrı bir paket gönderir — bkz. §3.1.
+
 ```cpp
 #pragma pack(push, 1)
 struct TelemetryPacket {
@@ -79,8 +82,24 @@ struct TelemetryPacket {
     uint8_t  ucus_durumu;     // [19] 0–4 (bkz. §5)
 };
 #pragma pack(pop)
-// Toplam: 17×4 + 2×1 + 1×1 = 71 byte
+// Toplam: 14×4 + 2×1 + 1×1 = 59 byte
 ```
+
+### 3.1 Görev Yükü Paketi (GorevYukuPaket)
+
+Kaynak: `UcusYazilimi/GorevYukuYazilimi/gorevyuku.cpp`. Aynı çerçeve protokolü
+(SYNC 0xAA 0x55 + LEN + CRC16-CCITT) kullanılır, ancak payload farklıdır:
+
+```cpp
+#pragma pack(push, 1)
+struct GorevYukuPaket {
+    float basinc, sicaklik, nem, irtifa;   // BME280 — basinc hPa cinsinden!
+    float gpsEnlem, gpsBoylam;             // GPS
+};  // 6 float = 24 byte → çerçeve: 2+1+24+2 = 29 byte
+#pragma pack(pop)
+```
+
+Python format: `'<6f'`. Görev yükü **dikey hız ve uçuş durumu göndermez**.
 
 ---
 

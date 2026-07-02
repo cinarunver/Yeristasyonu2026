@@ -1,12 +1,36 @@
 # ==============================================================================
-# TODO LİSTESİ:
-# 1. Hakem Yer İstasyonu Entegrasyonu (Hakem bilgisayarına COMPORT üzerinden veri gönderme)
-# 2. Lokal Loglama (Gelen verilerin CSV/TXT olarak kaydedilmesi)
-# 3. Parsing kısmının son hale göre güncellenmesi 
+# TODO LİSTESİ (Güncelleme: 2026-07-02)
+#
+# --- 📋 YAPILACAKLAR ---
+# 1. HYİ (Hakem Yer İstasyonu) entegrasyonu — TEKNOFEST hakem paketi formatı
+#    + ayrı COM port üzerinden gönderim (başlanmadı).
+# 2. Loglama iyileştirme: CSV format, timestamp, tüm telemetri alanları
+#    (şu an sadece özet satırı düz txt).
+# 3. Harita internete bağımlı (Leaflet CDN + CartoDB tile) — sahada internet
+#    yoksa boş ekran; offline tile fallback gerekli.
+# 4. "Veri kesildi" uyarısı (son paketten bu yana X sn geçtiyse görsel ikaz).
+# 5. kalman_monitor.py'nin commit edilmesi.
+#
+# --- ✓ YAPILDI (2026-07-02 düzeltme turu) ---
+# - Payload protokolü gerçek firmware'e uyarlandı: GorevYukuPaket 24B '<6f'
+#   (basinc hPa, sicaklik, nem, irtifa, gpsEnlem, gpsBoylam) — eski 71B format
+#   gerçek donanımla hiç eşleşmiyordu.
+# - Okuma modu (Binary/String) log formatından (Parsed/Raw) ayrıldı.
+# - String parser jenerikleştirildi (payload string modunda KeyError kalktı).
+# - CRC hatasında 2 bayt ilerleme (çerçeve kayması düzeltildi) + paket OK/hata
+#   sayaçları arayüze eklendi.
+# - Terminal (10 Hz) ve harita (2 Hz) güncellemeleri throttle edildi.
+# - Grafik verileri deque(maxlen=10000) yapıldı.
+# - stop() thread-güvenli hale getirildi; port okuma thread'inde kapanıyor.
+# - Buffer taşma koruması kuyruk koruyacak şekilde düzeltildi.
+# - Varsayılan baud 9600 (E32 LoRa alıcısı); update_plots hatası görünür.
+# - Lokal Loglama (TXT kaydı, commit 412d250)
 # ==============================================================================
-# YER İSTASYONU v3.0 — FRAMED BINARY TELEMETRİ PROTOKOLü
-# ESP32 (UcusYazilimi2026) → E32-433T30D LoRa / TTL → Bu uygulama
-# Protokol: [0xAA][0x55][LEN=71][TelemetryPacket 71B][CRC16_HI][CRC16_LO]
+# YER İSTASYONU v3.1 — FRAMED BINARY TELEMETRİ PROTOKOLü
+# Roket : ESP32 UcusYazilimi/src/main.cpp → E32-433T30D LoRa @9600, ~10 Hz
+#         [0xAA][0x55][LEN=59][TelemetryPacket 59B][CRC16_HI][CRC16_LO] = 64B
+# G.Yükü: ESP32 GorevYukuYazilimi/gorevyuku.cpp → E32-433T30D LoRa @9600, ~10 Hz
+#         [0xAA][0x55][LEN=24][GorevYukuPaket  24B][CRC16_HI][CRC16_LO] = 29B
 # ==============================================================================
 
 import sys
@@ -20,13 +44,15 @@ import serial.tools.list_ports
 from collections import deque
 
 # --- PAKET SABİTLERİ ---
+# Kaynak: UcusYazilimi/src/main.cpp (TelemetryPacket) ve
+#         UcusYazilimi/GorevYukuYazilimi/gorevyuku.cpp (GorevYukuPaket)
 ROCKET_PACKET_FORMAT = '<14f3B'
 ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 59 byte
 ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 64 byte
 
-PAYLOAD_PACKET_FORMAT = '<17f3B'
-PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 71 byte
-PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 76 byte
+PAYLOAD_PACKET_FORMAT = '<6f'  # basinc(hPa), sicaklik, nem, irtifa, gpsEnlem, gpsBoylam
+PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 24 byte
+PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 29 byte
 
 SYNC_1, SYNC_2 = 0xAA, 0x55
 
@@ -76,40 +102,57 @@ def parse_payload_frame(raw: bytes):
     if crc16_ccitt(payload) != crc_recv: return None
     v = struct.unpack(PAYLOAD_PACKET_FORMAT, payload)
     return {
-        'ivmeX': v[0],  'ivmeY': v[1],  'ivmeZ': v[2],
-        'gyroX': v[3],  'gyroY': v[4],  'gyroZ': v[5],
-        'roll':  v[6],  'pitch': v[7],  'yaw':   v[8],
-        'basinc': v[9], 'bmeSicaklik': v[10], 'irtifa': v[11], 'nem': v[12],
-        'dikeyHiz': v[13], 'eglimAcisi': v[14],
-        'gpsEnlem': v[15], 'gpsBoylam': v[16],
-        'ayrilma1_durum': bool(v[17]),
-        'ayrilma2_durum': bool(v[18]),
-        'ucus_durumu':    v[19],
+        'basinc': v[0], 'bmeSicaklik': v[1], 'nem': v[2], 'irtifa': v[3],
+        'gpsEnlem': v[4], 'gpsBoylam': v[5],
     }
 
+# String modundaki 'Anahtar: Değer' alanlarının paket alanlarına eşlenmesi.
+# Anahtarlar küçük harfle karşılaştırılır; roket ve görev yükü formatlarını birlikte kapsar.
+STRING_ALAN_HARITASI = {
+    'irtifa': ('irtifa', float),
+    'vz':     ('dikeyHiz', float),
+    'eglim':  ('eglimAcisi', float),
+    'roll':   ('roll', float),
+    'pitch':  ('pitch', float),
+    'yaw':    ('yaw', float),
+    'sic':    ('bmeSicaklik', float),
+    'nem':    ('nem', float),
+    'basinc': ('basinc', float),
+    'enlem':  ('gpsEnlem', float),
+    'boylam': ('gpsBoylam', float),
+    'durum':  ('ucus_durumu', int),
+}
+
 def parse_string_frame(text: str):
-    """'Irtifa: 123.45 | Vz: 12.34 | Eglim: 45.67 | Pitch: 45.67 | Durum: 1' formatındaki stringi ayrıştırır."""
+    """'Irtifa: 123.45 | Vz: 12.34 | ... | Durum: 1' benzeri 'Anahtar: Değer' stringlerini
+    ayrıştırır. Bilinmeyen alanları atlar, eksik alanları varsayılanla doldurur —
+    roket ve görev yükü string formatlarının ikisini de kabul eder."""
     try:
-        if "Irtifa:" not in text or "Vz:" not in text or "Durum:" not in text:
-            return None
-        parts = text.split('|')
-        irtifa = float(parts[0].split(':')[1].strip())
-        vz = float(parts[1].split(':')[1].strip())
-        eglim = float(parts[2].split(':')[1].strip())
-        pitch = float(parts[3].split(':')[1].strip())
-        durum = int(parts[4].split(':')[1].strip())
-        
-        return {
+        packet = {
             'ivmeX': 0.0, 'ivmeY': 0.0, 'ivmeZ': 0.0,
             'gyroX': 0.0, 'gyroY': 0.0, 'gyroZ': 0.0,
-            'roll': 0.0, 'pitch': pitch, 'yaw': 0.0,
-            'irtifa': irtifa,
-            'dikeyHiz': vz, 'eglimAcisi': eglim,
+            'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+            'basinc': 0.0, 'bmeSicaklik': 0.0, 'irtifa': 0.0, 'nem': 0.0,
+            'dikeyHiz': 0.0, 'eglimAcisi': 0.0,
             'gpsEnlem': 0.0, 'gpsBoylam': 0.0,
-            'ayrilma1_durum': False,
-            'ayrilma2_durum': False,
-            'ucus_durumu': durum,
+            'ayrilma1_durum': False, 'ayrilma2_durum': False,
+            'ucus_durumu': 0,
         }
+        bulunan = set()
+        for part in text.split('|'):
+            if ':' not in part:
+                continue
+            key, _, val = part.partition(':')
+            key = key.strip().lower().replace('ı', 'i')
+            eslesme = STRING_ALAN_HARITASI.get(key)
+            if eslesme is None:
+                continue
+            alan, tip = eslesme
+            packet[alan] = tip(float(val.strip()))
+            bulunan.add(alan)
+        if 'irtifa' not in bulunan or len(bulunan) < 2:
+            return None
+        return packet
     except Exception:
         return None
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -205,10 +248,11 @@ except Exception:
 
 # ----------------- SERIAL WORKER (QTHREAD) -----------------
 class SerialWorker(QThread):
-    raw_data_signal = pyqtSignal(str, str) 
+    raw_data_signal = pyqtSignal(str, str)
     parsed_data_signal = pyqtSignal(str, dict, float)
     error_signal = pyqtSignal(str, str)
     disconnected_signal = pyqtSignal(str)
+    stats_signal = pyqtSignal(str, int, int)  # identifier, geçerli paket, hatalı paket
 
     def __init__(self, port, baudrate, identifier, start_time, mode="binary"):
         super().__init__()
@@ -219,6 +263,8 @@ class SerialWorker(QThread):
         self.mode = mode
         self.is_running = True
         self.serial_conn = None
+        self.paket_ok = 0
+        self.paket_hata = 0
 
     def run(self):
         if self.port == "Simülatör":
@@ -232,56 +278,74 @@ class SerialWorker(QThread):
             return
 
         buf = bytearray()
-        while self.is_running and self.serial_conn and self.serial_conn.is_open:
-            try:
-                waiting = self.serial_conn.in_waiting
-                if waiting > 0:
-                    if self.mode == "binary":
-                        buf.extend(self.serial_conn.read(waiting))
-                        # Buffer overflow koruması
-                        max_frame = PAYLOAD_FRAME_SIZE * 10
-                        if len(buf) > max_frame:
-                            buf = bytearray()
-                        # SYNC arayıp çerçeve işle
-                        frame_size = ROCKET_FRAME_SIZE if self.identifier == "rocket" else PAYLOAD_FRAME_SIZE
-                        while len(buf) >= frame_size:
-                            idx = buf.find(bytes([SYNC_1, SYNC_2]))
-                            if idx == -1:
-                                buf = buf[-1:]; break
-                            if idx > 0:
-                                buf = buf[idx:]
-                            if len(buf) < frame_size:
-                                break
-                            frame = bytes(buf[:frame_size])
-                            buf   = buf[frame_size:]
-                            if self.identifier == "rocket":
-                                packet = parse_rocket_frame(frame)
-                            else:
-                                packet = parse_payload_frame(frame)
-                            
-                            if packet is not None:
-                                t = time.time() - self.start_time
-                                self.raw_data_signal.emit(self.identifier, frame.hex())
-                                self.parsed_data_signal.emit(self.identifier, packet, t)
-                    else:
-                        line = self.serial_conn.readline()
-                        if line:
-                            try:
+        sync = bytes([SYNC_1, SYNC_2])
+        frame_size = ROCKET_FRAME_SIZE if self.identifier == "rocket" else PAYLOAD_FRAME_SIZE
+        parse_fn = parse_rocket_frame if self.identifier == "rocket" else parse_payload_frame
+        son_stats = time.time()
+        try:
+            while self.is_running and self.serial_conn and self.serial_conn.is_open:
+                try:
+                    waiting = self.serial_conn.in_waiting
+                    if waiting > 0:
+                        if self.mode == "binary":
+                            buf.extend(self.serial_conn.read(waiting))
+                            # Taşma koruması: hepsini silme, kuyruğu koru (kısmi çerçeve kaybolmasın)
+                            if len(buf) > frame_size * 20:
+                                del buf[:len(buf) - frame_size * 2]
+                            while len(buf) >= frame_size:
+                                idx = buf.find(sync)
+                                if idx == -1:
+                                    # SYNC yok; son bayt 0xAA olabilir, onu sakla
+                                    del buf[:-1]
+                                    break
+                                if idx > 0:
+                                    del buf[:idx]
+                                if len(buf) < frame_size:
+                                    break
+                                frame = bytes(buf[:frame_size])
+                                packet = parse_fn(frame)
+                                if packet is not None:
+                                    del buf[:frame_size]
+                                    self.paket_ok += 1
+                                    t = time.time() - self.start_time
+                                    self.raw_data_signal.emit(self.identifier, frame.hex())
+                                    self.parsed_data_signal.emit(self.identifier, packet, t)
+                                else:
+                                    # LEN/CRC tutmadı: sahte SYNC olabilir — çerçeveyi atma,
+                                    # sadece SYNC'i geç ki kaymış gerçek çerçeve yakalanabilsin
+                                    del buf[:2]
+                                    self.paket_hata += 1
+                        else:
+                            line = self.serial_conn.readline()
+                            if line:
                                 text = line.decode('utf-8', errors='replace').strip()
                                 if text:
                                     self.raw_data_signal.emit(self.identifier, text)
                                     packet = parse_string_frame(text)
                                     if packet:
+                                        self.paket_ok += 1
                                         t = time.time() - self.start_time
                                         self.parsed_data_signal.emit(self.identifier, packet, t)
-                            except:
-                                pass
-                else:
-                    self.msleep(5)
-            except Exception as e:
-                self.error_signal.emit(self.identifier, f"Okuma hatası: {e}")
-                self.disconnected_signal.emit(self.identifier)
-                break
+                                    else:
+                                        self.paket_hata += 1
+                    else:
+                        self.msleep(5)
+
+                    now = time.time()
+                    if now - son_stats >= 1.0:
+                        self.stats_signal.emit(self.identifier, self.paket_ok, self.paket_hata)
+                        son_stats = now
+                except Exception as e:
+                    if self.is_running:
+                        self.error_signal.emit(self.identifier, f"Okuma hatası: {e}")
+                        self.disconnected_signal.emit(self.identifier)
+                    break
+        finally:
+            try:
+                if self.serial_conn and self.serial_conn.is_open:
+                    self.serial_conn.close()
+            except Exception:
+                pass
 
     def run_simulator(self):
         alt, vel, acc = 0.0, 0.0, 0.0
@@ -366,15 +430,11 @@ class SerialWorker(QThread):
                     if packet:
                         self.parsed_data_signal.emit(self.identifier, packet, t)
             else:
+                # GorevYukuPaket: basinc(hPa), sicaklik, nem, irtifa, gpsEnlem, gpsBoylam
                 payload = struct.pack(PAYLOAD_PACKET_FORMAT,
-                    random.uniform(-1,1), random.uniform(-1,1), acc,
-                    random.uniform(-1,1), random.uniform(-1,1), random.uniform(-1,1),
-                    r, p, yaw_a,
-                    101325.0 - sent_alt * 12.0, 25.0 - sent_alt * 0.006, sent_alt,
-                    45.0 + random.uniform(-1,1),
-                    vel, abs(p % 90),
-                    lat, lon,
-                    ayrilma1, ayrilma2, ucus_durumu
+                    1013.25 - sent_alt * 0.12, 25.0 - sent_alt * 0.006,
+                    45.0 + random.uniform(-1,1), sent_alt,
+                    lat, lon
                 )
                 crc = crc16_ccitt(payload)
                 if self.mode == "binary":
@@ -384,15 +444,31 @@ class SerialWorker(QThread):
                         self.raw_data_signal.emit(self.identifier, frame.hex())
                         self.parsed_data_signal.emit(self.identifier, packet, t)
                 else:
-                    text = f"Irtifa: {sent_alt:.2f} | Sic: {25.0 - sent_alt * 0.006:.1f} | Durum: {ucus_durumu}"
+                    text = f"Irtifa: {sent_alt:.2f} | Sic: {25.0 - sent_alt * 0.006:.1f} | Nem: {45.0:.1f}"
                     self.raw_data_signal.emit(self.identifier, text)
+                    packet = parse_string_frame(text)
+                    if packet:
+                        self.parsed_data_signal.emit(self.identifier, packet, t)
+
+            self.paket_ok += 1
+            now = time.time()
+            if now - getattr(self, '_sim_son_stats', 0.0) >= 1.0:
+                self.stats_signal.emit(self.identifier, self.paket_ok, self.paket_hata)
+                self._sim_son_stats = now
             self.msleep(100)
 
     def stop(self):
+        # Portu buradan (GUI thread) kapatma: okuma thread'i hâlâ kullanıyor olabilir.
+        # Bayrağı indir, thread kendi döngüsünden çıkıp portu finally'de kapatsın.
         self.is_running = False
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
-        self.wait()
+        if not self.wait(2000):
+            # Thread takıldıysa (ör. readline blokta) portu kapatarak okumayı kır
+            try:
+                if self.serial_conn and self.serial_conn.is_open:
+                    self.serial_conn.close()
+            except Exception:
+                pass
+            self.wait(1000)
 
 # ----------------- 3D OPENGL WIDGET -----------------
 class Rocket3DWidget(QOpenGLWidget):
@@ -536,22 +612,30 @@ class SerialViewerApp(QMainWindow):
         self.rocket_worker = None
         self.payload_worker = None
 
-        self.r_t_alt = []
-        self.r_alt = []
-        self.r_t_vel = []
-        self.r_vel = []
-        self.r_t_acc = []
-        self.r_acc = []
-        
-        self.p_t_alt = []
-        self.p_alt = []
-        self.p_t_temp = []
-        self.p_temp = []
-        self.p_t_press = []
-        self.p_press = []
+        # Grafik verileri: maxlen ile sınırlı — sınırsız büyüyüp GUI'yi yavaşlatmasın
+        # (10 Hz LoRa'da ~16 dk pencere)
+        VERI_PENCERESI = 10000
+        self.r_t_alt = deque(maxlen=VERI_PENCERESI)
+        self.r_alt = deque(maxlen=VERI_PENCERESI)
+        self.r_t_vel = deque(maxlen=VERI_PENCERESI)
+        self.r_vel = deque(maxlen=VERI_PENCERESI)
+        self.r_t_acc = deque(maxlen=VERI_PENCERESI)
+        self.r_acc = deque(maxlen=VERI_PENCERESI)
+
+        self.p_t_alt = deque(maxlen=VERI_PENCERESI)
+        self.p_alt = deque(maxlen=VERI_PENCERESI)
+        self.p_t_temp = deque(maxlen=VERI_PENCERESI)
+        self.p_temp = deque(maxlen=VERI_PENCERESI)
+        self.p_t_press = deque(maxlen=VERI_PENCERESI)
+        self.p_press = deque(maxlen=VERI_PENCERESI)
 
         self.is_logging = False
         self.log_file_path = ""
+
+        # Terminal/harita throttle zaman damgaları (100 Hz veri GUI'yi kilitlemesin)
+        self._son_terminal = {}
+        self._son_harita = {}
+        self._plot_hata_gosterildi = False
 
         self._setup_ui()
         self.refresh_ports()
@@ -581,7 +665,23 @@ class SerialViewerApp(QMainWindow):
         self.refresh_btn.setStyleSheet("font-weight: bold; padding: 10px; background-color: #333333; color: white;")
         self.refresh_btn.clicked.connect(self.refresh_ports)
         left_layout.addWidget(self.refresh_btn)
-        
+
+        # OKUMA MODU (log formatından bağımsız — telemetri nasıl okunacak?)
+        mode_group = QGroupBox("📡 Veri Okuma Modu")
+        mode_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 15px; }")
+        mode_layout = QHBoxLayout()
+        self.rb_mode_binary = QRadioButton("Binary (Framed)")
+        self.rb_mode_string = QRadioButton("String (Text)")
+        self.rb_mode_binary.setChecked(True)
+        self.rb_mode_binary.toggled.connect(self.change_program_mode)
+        self.read_mode_group = QButtonGroup()
+        self.read_mode_group.addButton(self.rb_mode_binary)
+        self.read_mode_group.addButton(self.rb_mode_string)
+        mode_layout.addWidget(self.rb_mode_binary)
+        mode_layout.addWidget(self.rb_mode_string)
+        mode_group.setLayout(mode_layout)
+        left_layout.addWidget(mode_group)
+
         # ROKET GRUBU
         rocket_group = QGroupBox("🚀 Roket")
         rocket_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 15px; }")
@@ -590,7 +690,7 @@ class SerialViewerApp(QMainWindow):
         self.rocket_cb = QComboBox()
         self.rocket_baud = QComboBox()
         self.rocket_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
-        self.rocket_baud.setCurrentText("115200")
+        self.rocket_baud.setCurrentText("9600")  # E32-433T30D LoRa alıcısı 9600 (firmware BAUD_LORA)
         self.rocket_connect_btn = QPushButton("Bağlan")
         self.rocket_connect_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self.rocket_disconnect_btn = QPushButton("Kes")
@@ -617,6 +717,7 @@ class SerialViewerApp(QMainWindow):
             "Durum":           QLabel("-"),
             "GPS":             QLabel("-"),
             "Aviyonik (R,P,Y)": QLabel("-"),
+            "Paket (OK/Hata)": QLabel("-"),
         }
         for key, lbl in self.rocket_labels.items():
             lbl.setStyleSheet("color: #2196F3; font-weight: bold; font-size: 15px;")
@@ -636,7 +737,7 @@ class SerialViewerApp(QMainWindow):
         self.payload_cb = QComboBox()
         self.payload_baud = QComboBox()
         self.payload_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
-        self.payload_baud.setCurrentText("115200")
+        self.payload_baud.setCurrentText("9600")  # E32-433T30D LoRa alıcısı 9600 (firmware BAUD_LORA)
         self.payload_connect_btn = QPushButton("Bağlan")
         self.payload_connect_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self.payload_disconnect_btn = QPushButton("Kes")
@@ -655,14 +756,14 @@ class SerialViewerApp(QMainWindow):
         pc2_layout.addWidget(self.payload_disconnect_btn)
 
         p_form_layout = QFormLayout()
+        # Not: Görev yükü firmware'i (GorevYukuPaket) dikey hız ve uçuş durumu GÖNDERMİYOR
         self.payload_labels = {
             "İrtifa (m)":      QLabel("-"),
-            "Dikey Hız (m/s)": QLabel("-"),
             "Sıcaklık (°C)":   QLabel("-"),
-            "Basınç (Pa)":     QLabel("-"),
+            "Basınç (hPa)":    QLabel("-"),
             "Nem (%)":         QLabel("-"),
             "GPS":             QLabel("-"),
-            "Durum":           QLabel("-"),
+            "Paket (OK/Hata)": QLabel("-"),
         }
         for key, lbl in self.payload_labels.items():
             lbl.setStyleSheet("color: #FF9800; font-weight: bold; font-size: 15px;")
@@ -809,8 +910,7 @@ class SerialViewerApp(QMainWindow):
         self.rb_parsed = QRadioButton("Parsed (Anlamlı Veri)")
         self.rb_raw = QRadioButton("Raw (String/Hex)")
         self.rb_parsed.setChecked(True)
-        self.rb_parsed.toggled.connect(self.change_program_mode)
-        
+
         self.log_format_group = QButtonGroup()
         self.log_format_group.addButton(self.rb_parsed)
         self.log_format_group.addButton(self.rb_raw)
@@ -855,10 +955,11 @@ class SerialViewerApp(QMainWindow):
         baudrate = self.rocket_baud.currentText()
         if not port: return
         
-        mode = "binary" if self.rb_parsed.isChecked() else "string"
+        mode = "binary" if self.rb_mode_binary.isChecked() else "string"
         self.rocket_worker = SerialWorker(port, baudrate, "rocket", self.start_time, mode)
         self.rocket_worker.raw_data_signal.connect(self.on_raw_data)
         self.rocket_worker.parsed_data_signal.connect(self.on_parsed_data)
+        self.rocket_worker.stats_signal.connect(self.on_stats)
         self.rocket_worker.error_signal.connect(self.on_sys_error)
         self.rocket_worker.disconnected_signal.connect(lambda i: self.disconnect_system(i))
         
@@ -876,10 +977,11 @@ class SerialViewerApp(QMainWindow):
         baudrate = self.payload_baud.currentText()
         if not port: return
         
-        mode = "binary" if self.rb_parsed.isChecked() else "string"
+        mode = "binary" if self.rb_mode_binary.isChecked() else "string"
         self.payload_worker = SerialWorker(port, baudrate, "payload", self.start_time, mode)
         self.payload_worker.raw_data_signal.connect(self.on_raw_data)
         self.payload_worker.parsed_data_signal.connect(self.on_parsed_data)
+        self.payload_worker.stats_signal.connect(self.on_stats)
         self.payload_worker.error_signal.connect(self.on_sys_error)
         self.payload_worker.disconnected_signal.connect(lambda i: self.disconnect_system(i))
         
@@ -894,6 +996,9 @@ class SerialViewerApp(QMainWindow):
 
     def disconnect_system(self, identifier):
         if identifier == "rocket":
+            # Zaten kesildiyse (ör. hem stop() hem worker sinyali tetiklendi) tekrarlama
+            if self.rocket_worker is None and self.rocket_connect_btn.isEnabled():
+                return
             if self.rocket_worker:
                 self.rocket_worker.stop()
                 self.rocket_worker = None
@@ -903,6 +1008,8 @@ class SerialViewerApp(QMainWindow):
             self.rocket_baud.setEnabled(True)
             self.on_raw_data("rocket", "=== BAĞLANTI KESİLDİ ===")
         elif identifier == "payload":
+            if self.payload_worker is None and self.payload_connect_btn.isEnabled():
+                return
             if self.payload_worker:
                 self.payload_worker.stop()
                 self.payload_worker = None
@@ -915,7 +1022,13 @@ class SerialViewerApp(QMainWindow):
     def on_raw_data(self, identifier, raw_str):
         if self.is_logging and self.rb_raw.isChecked():
             self.write_log(f"[{identifier.upper()}] RAW: {raw_str}")
-            
+
+        # Terminal throttle: kaynak başına en fazla 10 satır/sn; sistem mesajları (===) muaf
+        now = time.monotonic()
+        if not raw_str.startswith("===") and now - self._son_terminal.get(identifier, 0.0) < 0.1:
+            return
+        self._son_terminal[identifier] = now
+
         if identifier == "rocket":
             self.append_text(f'<span style="color:#2196F3; font-weight:bold;">[ROKET]</span> {raw_str}')
         else:
@@ -940,17 +1053,22 @@ class SerialViewerApp(QMainWindow):
                     f"{packet['roll']:.1f}, {packet['pitch']:.1f}, {packet['yaw']:.1f}")
 
                 self.gl_widget.set_angles(packet['roll'], packet['pitch'], packet['yaw'])
-                if packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0:
+                now = time.monotonic()
+                if (packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0) and \
+                        now - self._son_harita.get("rocket", 0.0) >= 0.5:
+                    self._son_harita["rocket"] = now
                     self.web_view.page().runJavaScript(
-                        f"updateRocket({packet['gpsEnlem']}, {packet['gpsBoylam']});")
-                
-                # Terminale parse edilmiş özeti bas
+                        f"if (typeof updateRocket === 'function') updateRocket({packet['gpsEnlem']}, {packet['gpsBoylam']});")
+
                 summary = (f"Alt:{packet['irtifa']:.1f}m | Hiz:{packet['dikeyHiz']:.1f}m/s | "
                            f"Durum:{DURUM_ETIKET.get(packet['ucus_durumu'],'?')} | "
                            f"GPS:{packet['gpsEnlem']:.4f},{packet['gpsBoylam']:.4f}")
-                self.append_text(f'<span style="color:#8BC34A;">  └─ [PARSE] {summary}</span>')
                 if self.is_logging and self.rb_parsed.isChecked():
                     self.write_log(f"[ROKET] PARSED: {summary}")
+                # Terminale parse özetini throttle'lı bas
+                if now - self._son_terminal.get("rocket_parse", 0.0) >= 0.1:
+                    self._son_terminal["rocket_parse"] = now
+                    self.append_text(f'<span style="color:#8BC34A;">  └─ [PARSE] {summary}</span>')
 
             except Exception as e:
                 self.append_text(f'<span style="color:#F44336;">[PARSE HATASI] {e}</span>')
@@ -960,28 +1078,29 @@ class SerialViewerApp(QMainWindow):
                 self.payload_labels["İrtifa (m)"].setText(f"{packet['irtifa']:.1f}")
                 self.p_alt.append(packet['irtifa']); self.p_t_alt.append(t)
 
-                self.payload_labels["Dikey Hız (m/s)"].setText(f"{packet['dikeyHiz']:.2f}")
-
                 self.payload_labels["Sıcaklık (°C)"].setText(f"{packet['bmeSicaklik']:.1f}")
                 self.p_temp.append(packet['bmeSicaklik']); self.p_t_temp.append(t)
 
-                self.payload_labels["Basınç (Pa)"].setText(f"{packet['basinc']:.0f}")
+                self.payload_labels["Basınç (hPa)"].setText(f"{packet['basinc']:.1f}")
                 self.p_press.append(packet['basinc']); self.p_t_press.append(t)
 
                 self.payload_labels["Nem (%)"].setText(f"{packet['nem']:.1f}")
                 self.payload_labels["GPS"].setText(f"{packet['gpsEnlem']:.5f}, {packet['gpsBoylam']:.5f}")
-                self.payload_labels["Durum"].setText(DURUM_ETIKET.get(packet['ucus_durumu'], '?'))
 
-                if packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0:
+                now = time.monotonic()
+                if (packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0) and \
+                        now - self._son_harita.get("payload", 0.0) >= 0.5:
+                    self._son_harita["payload"] = now
                     self.web_view.page().runJavaScript(
-                        f"updatePayload({packet['gpsEnlem']}, {packet['gpsBoylam']});")
-                
-                # Terminale parse edilmiş özeti bas
+                        f"if (typeof updatePayload === 'function') updatePayload({packet['gpsEnlem']}, {packet['gpsBoylam']});")
+
                 summary = (f"Alt:{packet['irtifa']:.1f}m | Sic:{packet['bmeSicaklik']:.1f}°C | "
                            f"GPS:{packet['gpsEnlem']:.4f},{packet['gpsBoylam']:.4f}")
-                self.append_text(f'<span style="color:#CDDC39;">  └─ [PARSE] {summary}</span>')
                 if self.is_logging and self.rb_parsed.isChecked():
                     self.write_log(f"[G.YÜKÜ] PARSED: {summary}")
+                if now - self._son_terminal.get("payload_parse", 0.0) >= 0.1:
+                    self._son_terminal["payload_parse"] = now
+                    self.append_text(f'<span style="color:#CDDC39;">  └─ [PARSE] {summary}</span>')
 
             except Exception as e:
                 self.append_text(f'<span style="color:#F44336;">[PAYLOAD PARSE HATASI] {e}</span>')
@@ -1020,12 +1139,19 @@ class SerialViewerApp(QMainWindow):
             self.append_text(f'<span style="color:#F44336;">[LOG YAZMA HATASI] {e}</span>')
 
     def change_program_mode(self):
-        mode = "binary" if self.rb_parsed.isChecked() else "string"
+        mode = "binary" if self.rb_mode_binary.isChecked() else "string"
         if self.rocket_worker:
             self.rocket_worker.mode = mode
         if self.payload_worker:
             self.payload_worker.mode = mode
         self.append_text(f'<span style="color:#00BCD4; font-weight:bold;">[MOD DEĞİŞTİ] Tüm program "{mode.upper()}" okuma moduna geçti.</span>')
+
+    def on_stats(self, identifier, ok, hata):
+        metin = f"{ok} ✓ / {hata} ✗"
+        if identifier == "rocket":
+            self.rocket_labels["Paket (OK/Hata)"].setText(metin)
+        else:
+            self.payload_labels["Paket (OK/Hata)"].setText(metin)
 
     def on_sys_error(self, identifier, err_msg):
         self.append_text(f'<span style="color:#F44336; font-weight:bold;">[HATA-{identifier.upper()}] {err_msg}</span>')
@@ -1045,8 +1171,11 @@ class SerialViewerApp(QMainWindow):
                 self.curve_p_temp.setData(list(self.p_t_temp), list(self.p_temp))
             if len(self.p_t_press) == len(self.p_press) and len(self.p_press) > 0:
                 self.curve_p_press.setData(list(self.p_t_press), list(self.p_press))
-        except Exception: 
-            pass
+        except Exception as e:
+            # Sessizce yutma: ilk hatayı terminale bas (spam olmasın diye bir kez)
+            if not self._plot_hata_gosterildi:
+                self._plot_hata_gosterildi = True
+                self.append_text(f'<span style="color:#F44336;">[GRAFİK HATASI] {e}</span>')
 
     def append_text(self, text):
         formatted_text = text.replace('\n', '<br/>').replace('\r', '')
