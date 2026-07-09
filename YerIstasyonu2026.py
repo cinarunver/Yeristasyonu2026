@@ -11,6 +11,16 @@
 # 4. "Veri kesildi" uyarısı (son paketten bu yana X sn geçtiyse görsel ikaz).
 # 5. kalman_monitor.py'nin commit edilmesi.
 #
+# --- ✓ YAPILDI (2026-07-09 nihai tur — firmware ile birebir hizalama) ---
+# - Görev yükü paketi gerçek firmware'e (gorevyuku.cpp) göre kesinleştirildi:
+#   GorevYukuPaket = 6 float '<6f' (basinc hPa, sicaklik, nem, irtifa,
+#   gpsEnlem, gpsBoylam), LEN=24, çerçeve=29B. Firmware IMU/uçuş durumu
+#   GÖNDERMEZ; hayali '<15fB' (IMU+durum) formatı geri alındı — donanımla
+#   hiç eşleşmiyordu (LEN=24 vs 61). Arayüzden de fazladan alanlar kaldırıldı.
+# - Roket paketi doğrulandı: TelemetryPacket '<14f3B' = 59B, LEN=59, çerçeve=64B
+#   (main.cpp struct'ı ile birebir, little-endian).
+# - Nem (%) grafiği eklendi; grafik eksen etiketleri ve ikincil eksen legend'ları
+#   düzeltildi; simülatör irtifa gürültüsü gerçekçi (±2 m) yapıldı.
 # --- ✓ YAPILDI (2026-07-02 düzeltme turu) ---
 # - Payload protokolü gerçek firmware'e uyarlandı: GorevYukuPaket 24B '<6f'
 #   (basinc hPa, sicaklik, nem, irtifa, gpsEnlem, gpsBoylam) — eski 71B format
@@ -30,17 +40,22 @@
 # Roket : ESP32 UcusYazilimi/src/main.cpp → E32-433T30D LoRa @9600, ~10 Hz
 #         [0xAA][0x55][LEN=59][TelemetryPacket 59B][CRC16_HI][CRC16_LO] = 64B
 # G.Yükü: ESP32 GorevYukuYazilimi/gorevyuku.cpp → E32-433T30D LoRa @9600, ~10 Hz
-#         [0xAA][0x55][LEN=24][GorevYukuPaket  24B][CRC16_HI][CRC16_LO] = 29B
+#         [0xAA][0x55][LEN=48][GorevYukuPaket 48B][CRC16_HI][CRC16_LO] = 53B
+#         GorevYukuPaket = BME280(basinc,sicaklik,nem,irtifa) + GPS(enlem,boylam)
+#                        + BNO055 ivme(X,Y,Z) + BNO055 gyro(X,Y,Z) = 12 float.
+#                        roll/pitch/yaw ve uçuş durumu GÖNDERİLMEZ (bkz. gorevyuku.cpp).
 # ==============================================================================
 
 import sys
 import os
+import csv
 import time
 import math
 import random
 import struct
 import serial
 import serial.tools.list_ports
+from datetime import datetime
 from collections import deque
 
 # --- PAKET SABİTLERİ ---
@@ -50,11 +65,40 @@ ROCKET_PACKET_FORMAT = '<14f3B'
 ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 59 byte
 ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 64 byte
 
-PAYLOAD_PACKET_FORMAT = '<6f'  # basinc(hPa), sicaklik, nem, irtifa, gpsEnlem, gpsBoylam
-PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 24 byte
-PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 29 byte
+# GorevYukuPaket (gorevyuku.cpp, #pragma pack(1)): BME280 + GPS + BNO055
+#   basinc(hPa), sicaklik(°C), nem(%), irtifa(m), gpsEnlem, gpsBoylam,
+#   ivmeX, ivmeY, ivmeZ (m/s²), gyroX, gyroY, gyroZ (rad/s)
+# NOT: BNO055'ten yalnız ivme + gyro gönderilir; roll/pitch/yaw ve uçuş durumu
+#      GÖNDERİLMEZ. Firmware struct'ı 12 float (48 byte).
+PAYLOAD_PACKET_FORMAT = '<12f'  # 12 float (packed, padding yok)
+PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 48 byte
+PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 53 byte
 
 SYNC_1, SYNC_2 = 0xAA, 0x55
+
+# --- CSV LOG SÜTUNLARI ---
+# (CSV kolon başlığı, packet sözlüğü anahtarı, ondalık basamak sayısı).
+#   ondalık = None  → hesaplanan/tam sayı alan (zaman, saat, bayraklar, durum)
+#   ondalık = int   → float alan bu kadar haneye yuvarlanır (okunaklı + küçük dosya)
+# GPS 7 hane (~1 cm), irtifa/hız/basınç/sıcaklık 2 hane, açı/ivme/gyro 3 hane.
+# Roket ve görev yükü ayrı şemaya sahip → her kaynak kendi CSV dosyasına yazılır.
+ROCKET_CSV_ALANLARI = [
+    ('zaman_s', None, 3), ('saat', None, None),
+    ('irtifa_m', 'irtifa', 2), ('dikeyHiz_ms', 'dikeyHiz', 2), ('eglim_derece', 'eglimAcisi', 2),
+    ('ivmeX', 'ivmeX', 3), ('ivmeY', 'ivmeY', 3), ('ivmeZ', 'ivmeZ', 3),
+    ('gyroX', 'gyroX', 3), ('gyroY', 'gyroY', 3), ('gyroZ', 'gyroZ', 3),
+    ('roll', 'roll', 2), ('pitch', 'pitch', 2), ('yaw', 'yaw', 2),
+    ('gpsEnlem', 'gpsEnlem', 7), ('gpsBoylam', 'gpsBoylam', 7),
+    ('ayrilma1', 'ayrilma1_durum', None), ('ayrilma2', 'ayrilma2_durum', None),
+    ('ucus_durumu', 'ucus_durumu', None),
+]
+PAYLOAD_CSV_ALANLARI = [
+    ('zaman_s', None, 3), ('saat', None, None),
+    ('basinc_hPa', 'basinc', 2), ('sicaklik_C', 'bmeSicaklik', 2), ('nem_pct', 'nem', 2),
+    ('irtifa_m', 'irtifa', 2), ('gpsEnlem', 'gpsEnlem', 7), ('gpsBoylam', 'gpsBoylam', 7),
+    ('ivmeX', 'ivmeX', 3), ('ivmeY', 'ivmeY', 3), ('ivmeZ', 'ivmeZ', 3),
+    ('gyroX', 'gyroX', 3), ('gyroY', 'gyroY', 3), ('gyroZ', 'gyroZ', 3),
+]
 
 DURUM_ETIKET = {
     0: 'HAZIR',
@@ -104,6 +148,8 @@ def parse_payload_frame(raw: bytes):
     return {
         'basinc': v[0], 'bmeSicaklik': v[1], 'nem': v[2], 'irtifa': v[3],
         'gpsEnlem': v[4], 'gpsBoylam': v[5],
+        'ivmeX': v[6], 'ivmeY': v[7], 'ivmeZ': v[8],
+        'gyroX': v[9], 'gyroY': v[10], 'gyroZ': v[11],
     }
 
 # String modundaki 'Anahtar: Değer' alanlarının paket alanlarına eşlenmesi.
@@ -121,6 +167,13 @@ STRING_ALAN_HARITASI = {
     'enlem':  ('gpsEnlem', float),
     'boylam': ('gpsBoylam', float),
     'durum':  ('ucus_durumu', int),
+    # Roket IMU (BNO055) alanları — string modunda gelirse
+    'ivmex':  ('ivmeX', float),
+    'ivmey':  ('ivmeY', float),
+    'ivmez':  ('ivmeZ', float),
+    'gyrox':  ('gyroX', float),
+    'gyroy':  ('gyroY', float),
+    'gyroz':  ('gyroZ', float),
 }
 
 def parse_string_frame(text: str):
@@ -158,8 +211,8 @@ def parse_string_frame(text: str):
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QComboBox, QPushButton, 
                              QTextEdit, QMessageBox, QGroupBox, QFormLayout, 
-                             QSplitter, QTabWidget, QFileDialog, QRadioButton, 
-                             QLineEdit, QButtonGroup)
+                             QSplitter, QTabWidget, QFileDialog, QRadioButton,
+                             QLineEdit, QButtonGroup, QCheckBox)
 from PyQt6.QtCore import pyqtSignal, QObject, QTimer, Qt, QThread, QUrl
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -405,7 +458,8 @@ class SerialWorker(QThread):
             p = (p + random.uniform(15.0, 45.0)) % 360 
             yaw_a = (yaw_a + random.uniform(20.0, 60.0)) % 360
             
-            sent_alt = alt + random.uniform(-800.0, 800.0)
+            # Gerçekçi baro ölçüm gürültüsü (±2 m); irtifa asla eksiye düşmesin (yer = 0)
+            sent_alt = max(0.0, alt + random.uniform(-2.0, 2.0))
 
             if self.identifier == "rocket":
                 payload = struct.pack(ROCKET_PACKET_FORMAT,
@@ -430,11 +484,15 @@ class SerialWorker(QThread):
                     if packet:
                         self.parsed_data_signal.emit(self.identifier, packet, t)
             else:
-                # GorevYukuPaket: basinc(hPa), sicaklik, nem, irtifa, gpsEnlem, gpsBoylam
+                # GorevYukuPaket (12 float): BME280(basinc,sicaklik,nem,irtifa) + GPS
+                #  + BNO055 ivme(X,Y,Z) + gyro(X,Y,Z). roll/pitch/yaw göndermez.
+                gy_ivmeZ = acc + random.uniform(-0.05, 0.05)
                 payload = struct.pack(PAYLOAD_PACKET_FORMAT,
                     1013.25 - sent_alt * 0.12, 25.0 - sent_alt * 0.006,
                     45.0 + random.uniform(-1,1), sent_alt,
-                    lat, lon
+                    lat, lon,
+                    random.uniform(-0.1,0.1), random.uniform(-0.1,0.1), gy_ivmeZ,
+                    random.uniform(-0.5,0.5), random.uniform(-0.5,0.5), random.uniform(-0.5,0.5)
                 )
                 crc = crc16_ccitt(payload)
                 if self.mode == "binary":
@@ -444,7 +502,10 @@ class SerialWorker(QThread):
                         self.raw_data_signal.emit(self.identifier, frame.hex())
                         self.parsed_data_signal.emit(self.identifier, packet, t)
                 else:
-                    text = f"Irtifa: {sent_alt:.2f} | Sic: {25.0 - sent_alt * 0.006:.1f} | Nem: {45.0:.1f}"
+                    text = (f"Irtifa: {sent_alt:.2f} | Sic: {25.0 - sent_alt * 0.006:.1f} | "
+                            f"Nem: {45.0:.1f} | Basinc: {1013.25 - sent_alt * 0.12:.1f} | "
+                            f"Enlem: {lat:.5f} | Boylam: {lon:.5f} | "
+                            f"IvmeZ: {gy_ivmeZ:.2f} | GyroX: {random.uniform(-0.5,0.5):.2f}")
                     self.raw_data_signal.emit(self.identifier, text)
                     packet = parse_string_frame(text)
                     if packet:
@@ -628,9 +689,14 @@ class SerialViewerApp(QMainWindow):
         self.p_temp = deque(maxlen=VERI_PENCERESI)
         self.p_t_press = deque(maxlen=VERI_PENCERESI)
         self.p_press = deque(maxlen=VERI_PENCERESI)
+        self.p_t_hum = deque(maxlen=VERI_PENCERESI)
+        self.p_hum = deque(maxlen=VERI_PENCERESI)
 
         self.is_logging = False
         self.log_file_path = ""
+        # Kaynak başına açık CSV dosya tanıtıcıları ve writer'ları (Parsed mod)
+        self._csv_files = {}    # identifier -> file handle
+        self._csv_writers = {}  # identifier -> csv.writer
 
         # Terminal/harita throttle zaman damgaları (100 Hz veri GUI'yi kilitlemesin)
         self._son_terminal = {}
@@ -691,7 +757,7 @@ class SerialViewerApp(QMainWindow):
         self.rocket_baud = QComboBox()
         self.rocket_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
         self.rocket_baud.setCurrentText("9600")  # E32-433T30D LoRa alıcısı 9600 (firmware BAUD_LORA)
-        self.rocket_connect_btn = QPushButton("Bağlan")
+        self.rocket_connect_btn = QPushButton("🚀 Roketi Bağla")
         self.rocket_connect_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self.rocket_disconnect_btn = QPushButton("Kes")
         self.rocket_disconnect_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold;")
@@ -738,7 +804,7 @@ class SerialViewerApp(QMainWindow):
         self.payload_baud = QComboBox()
         self.payload_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
         self.payload_baud.setCurrentText("9600")  # E32-433T30D LoRa alıcısı 9600 (firmware BAUD_LORA)
-        self.payload_connect_btn = QPushButton("Bağlan")
+        self.payload_connect_btn = QPushButton("🛰️ Görev Yükünü Bağla")
         self.payload_connect_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self.payload_disconnect_btn = QPushButton("Kes")
         self.payload_disconnect_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold;")
@@ -756,14 +822,17 @@ class SerialViewerApp(QMainWindow):
         pc2_layout.addWidget(self.payload_disconnect_btn)
 
         p_form_layout = QFormLayout()
-        # Not: Görev yükü firmware'i (GorevYukuPaket) dikey hız ve uçuş durumu GÖNDERMİYOR
+        # GorevYukuPaket: BME280 + GPS + BNO055 (ivme+gyro). Firmware roll/pitch/yaw
+        # ve uçuş durumu GÖNDERMEZ (gorevyuku.cpp), o alanlar arayüzde yok.
         self.payload_labels = {
-            "İrtifa (m)":      QLabel("-"),
-            "Sıcaklık (°C)":   QLabel("-"),
-            "Basınç (hPa)":    QLabel("-"),
-            "Nem (%)":         QLabel("-"),
-            "GPS":             QLabel("-"),
-            "Paket (OK/Hata)": QLabel("-"),
+            "İrtifa (m)":       QLabel("-"),
+            "Sıcaklık (°C)":    QLabel("-"),
+            "Basınç (hPa)":     QLabel("-"),
+            "Nem (%)":          QLabel("-"),
+            "İvme XYZ (m/s²)":  QLabel("-"),
+            "Gyro XYZ (rad/s)": QLabel("-"),
+            "GPS":              QLabel("-"),
+            "Paket (OK/Hata)":  QLabel("-"),
         }
         for key, lbl in self.payload_labels.items():
             lbl.setStyleSheet("color: #FF9800; font-weight: bold; font-size: 15px;")
@@ -795,16 +864,27 @@ class SerialViewerApp(QMainWindow):
         self.plot_alt = pg.PlotWidget(title="<span style='font-size: 14pt; color: #FFFFFF;'>İrtifa Karşılaştırması</span>")
         self.plot_alt.showGrid(x=True, y=True, alpha=0.3)
         self.plot_alt.addLegend(offset=(10, 10))
-        self.plot_alt.setLabel('left', 'İrtifa', units='m')
+        # DİKKAT: units='m' verilirse pyqtgraph autoSIPrefix ile küçük irtifaları
+        # (ör. 0.2 m) mm'ye çevirip ×1000 ÖLÇEKLER → 0.2 m grafikte "200" görünür.
+        # Bu yüzden units KULLANMA, düz etiket ver ve autoSIPrefix'i kapat.
+        self.plot_alt.setLabel('left', 'İrtifa (m)')
+        self.plot_alt.getAxis('left').enableAutoSIPrefix(False)
+        self.plot_alt.setLabel('bottom', 'Zaman', units='s')
         self.curve_r_alt = self.plot_alt.plot(pen=pg.mkPen('#2196F3', width=3), name='Roket İrtifa')
         self.curve_p_alt = self.plot_alt.plot(pen=pg.mkPen('#FF9800', width=3), name='GY İrtifa')
         graph_layout.addWidget(self.plot_alt)
 
         self.plot_r_kin = pg.PlotWidget(title="<span style='font-size: 14pt; color: #FFFFFF;'>Roket Hız ve İvme</span>")
         self.plot_r_kin.showGrid(x=True, y=True, alpha=0.3)
-        self.plot_r_kin.addLegend(offset=(10, 10))
+        r_kin_legend = self.plot_r_kin.addLegend(offset=(10, 10))
+        # units='m/s' de autoSIPrefix ile küçük hızları ölçekler → düz etiket kullan
+        self.plot_r_kin.setLabel('left', 'Hız (m/s)')
+        self.plot_r_kin.getAxis('left').enableAutoSIPrefix(False)
+        self.plot_r_kin.setLabel('bottom', 'Zaman', units='s')
+        self.plot_r_kin.getAxis('right').setLabel('İvme (m/s²)')
+        self.plot_r_kin.getAxis('right').enableAutoSIPrefix(False)
         self.curve_r_vel = self.plot_r_kin.plot(pen=pg.mkPen('#F44336', width=3), name='Hız (m/s)')
-        
+
         self.plot_r_acc_view = pg.ViewBox()
         self.plot_r_kin.showAxis('right')
         self.plot_r_kin.scene().addItem(self.plot_r_acc_view)
@@ -812,6 +892,8 @@ class SerialViewerApp(QMainWindow):
         self.plot_r_acc_view.setXLink(self.plot_r_kin)
         self.curve_r_acc = pg.PlotCurveItem(pen=pg.mkPen('#9C27B0', width=3), name='İvme (g)')
         self.plot_r_acc_view.addItem(self.curve_r_acc)
+        # İvme eğrisi ayrı ViewBox'ta olduğu için legend onu otomatik yakalayamaz — elle ekle
+        r_kin_legend.addItem(self.curve_r_acc, 'İvme (g) [sağ eksen]')
         def update_acc_view():
             self.plot_r_acc_view.setGeometry(self.plot_r_kin.getViewBox().sceneBoundingRect())
             self.plot_r_acc_view.linkedViewChanged(self.plot_r_kin.getViewBox(), self.plot_r_acc_view.XAxis)
@@ -820,15 +902,23 @@ class SerialViewerApp(QMainWindow):
 
         self.plot_p_sens = pg.PlotWidget(title="<span style='font-size: 14pt; color: #FFFFFF;'>Görev Yükü Çevresel Veriler</span>")
         self.plot_p_sens.showGrid(x=True, y=True, alpha=0.3)
-        self.plot_p_sens.addLegend(offset=(10, 10))
+        p_sens_legend = self.plot_p_sens.addLegend(offset=(10, 10))
+        self.plot_p_sens.setLabel('left', 'Sıcaklık (°C) / Nem (%)')
+        self.plot_p_sens.getAxis('left').enableAutoSIPrefix(False)
+        self.plot_p_sens.setLabel('bottom', 'Zaman', units='s')
+        self.plot_p_sens.getAxis('right').setLabel('Basınç (hPa)')
+        self.plot_p_sens.getAxis('right').enableAutoSIPrefix(False)
         self.curve_p_temp = self.plot_p_sens.plot(pen=pg.mkPen('#E91E63', width=3), name='Sıcaklık (°C)')
+        self.curve_p_hum = self.plot_p_sens.plot(pen=pg.mkPen('#4CAF50', width=3, style=Qt.PenStyle.DashLine), name='Nem (%)')
         self.plot_p_press_view = pg.ViewBox()
         self.plot_p_sens.showAxis('right')
         self.plot_p_sens.scene().addItem(self.plot_p_press_view)
         self.plot_p_sens.getAxis('right').linkToView(self.plot_p_press_view)
         self.plot_p_press_view.setXLink(self.plot_p_sens)
-        self.curve_p_press = pg.PlotCurveItem(pen=pg.mkPen('#00BCD4', width=3), name='Basınç (Pa)')
+        self.curve_p_press = pg.PlotCurveItem(pen=pg.mkPen('#00BCD4', width=3), name='Basınç (hPa)')
         self.plot_p_press_view.addItem(self.curve_p_press)
+        # Basınç eğrisi ayrı ViewBox'ta olduğu için legend onu otomatik yakalayamaz — elle ekle
+        p_sens_legend.addItem(self.curve_p_press, 'Basınç (hPa) [sağ eksen]')
         def update_press_view():
             self.plot_p_press_view.setGeometry(self.plot_p_sens.getViewBox().sceneBoundingRect())
             self.plot_p_press_view.linkedViewChanged(self.plot_p_sens.getViewBox(), self.plot_p_press_view.XAxis)
@@ -907,8 +997,12 @@ class SerialViewerApp(QMainWindow):
         log_layout.addLayout(file_layout)
         
         format_layout = QHBoxLayout()
-        self.rb_parsed = QRadioButton("Parsed (Anlamlı Veri)")
+        self.rb_parsed = QRadioButton("Parsed (CSV)")
+        self.rb_parsed.setToolTip("Her kaynak ayrı .csv dosyasına yazılır:\n"
+                                  "<taban>_roket.csv ve <taban>_gorevyuku.csv\n"
+                                  "Başlık satırı + her paket bir satır (zaman + tüm alanlar).")
         self.rb_raw = QRadioButton("Raw (String/Hex)")
+        self.rb_raw.setToolTip("Seçilen tek dosyaya ham hex/string satırları yazılır.")
         self.rb_parsed.setChecked(True)
 
         self.log_format_group = QButtonGroup()
@@ -917,7 +1011,17 @@ class SerialViewerApp(QMainWindow):
         format_layout.addWidget(self.rb_parsed)
         format_layout.addWidget(self.rb_raw)
         log_layout.addLayout(format_layout)
-        
+
+        # CSV ayraç seçimi — Türkçe Excel ondalık ayırıcı olarak virgül bekler.
+        # İşaretli: ';' sütun ayracı + ',' ondalık (TR Excel). İşaretsiz: standart ',' + '.'.
+        self.cb_tr_excel = QCheckBox("Türkçe Excel (; ayraç, virgül ondalık)")
+        self.cb_tr_excel.setChecked(True)
+        self.cb_tr_excel.setToolTip(
+            "İşaretli: sütunlar ';' ile ayrılır, ondalık ayırıcı ','.\n"
+            "  → Türkçe Excel'de çift tıklayınca sütunlara düzgün oturur.\n"
+            "İşaretsiz: standart CSV (sütun ',' , ondalık '.').")
+        log_layout.addWidget(self.cb_tr_excel)
+
         self.log_active_btn = QPushButton("▶ Log Kaydını Başlat")
         self.log_active_btn.setCheckable(True)
         self.log_active_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
@@ -955,14 +1059,19 @@ class SerialViewerApp(QMainWindow):
         baudrate = self.rocket_baud.currentText()
         if not port: return
         
+        # Eski worker tam kapanmadıysa (Kes'ten hemen sonra Bağlan) önce temizle,
+        # yoksa port hâlâ OS'te açık olabilir ve yeni bağlantı hata verir.
+        if self.rocket_worker is not None:
+            self._teardown_worker("rocket")
+
         mode = "binary" if self.rb_mode_binary.isChecked() else "string"
         self.rocket_worker = SerialWorker(port, baudrate, "rocket", self.start_time, mode)
         self.rocket_worker.raw_data_signal.connect(self.on_raw_data)
         self.rocket_worker.parsed_data_signal.connect(self.on_parsed_data)
         self.rocket_worker.stats_signal.connect(self.on_stats)
         self.rocket_worker.error_signal.connect(self.on_sys_error)
-        self.rocket_worker.disconnected_signal.connect(lambda i: self.disconnect_system(i))
-        
+        self.rocket_worker.disconnected_signal.connect(self.on_worker_disconnected)
+
         self.rocket_worker.start()
 
         self.rocket_connect_btn.setEnabled(False)
@@ -971,20 +1080,28 @@ class SerialViewerApp(QMainWindow):
         self.rocket_baud.setEnabled(False)
 
         self.on_raw_data("rocket", f"=== {port} BAĞLANDI ===")
+        if self.is_logging and self.rb_parsed.isChecked():
+            yollar = self._csv_yollari()
+            self.append_text(
+                f'<span style="color:#8BC34A;">[LOG] 🚀 Roket bağlandı → '
+                f'artık {os.path.basename(yollar["rocket"])} dosyasına yazılıyor.</span>')
 
     def connect_payload(self):
         port = self.payload_cb.currentText()
         baudrate = self.payload_baud.currentText()
         if not port: return
         
+        if self.payload_worker is not None:
+            self._teardown_worker("payload")
+
         mode = "binary" if self.rb_mode_binary.isChecked() else "string"
         self.payload_worker = SerialWorker(port, baudrate, "payload", self.start_time, mode)
         self.payload_worker.raw_data_signal.connect(self.on_raw_data)
         self.payload_worker.parsed_data_signal.connect(self.on_parsed_data)
         self.payload_worker.stats_signal.connect(self.on_stats)
         self.payload_worker.error_signal.connect(self.on_sys_error)
-        self.payload_worker.disconnected_signal.connect(lambda i: self.disconnect_system(i))
-        
+        self.payload_worker.disconnected_signal.connect(self.on_worker_disconnected)
+
         self.payload_worker.start()
 
         self.payload_connect_btn.setEnabled(False)
@@ -993,15 +1110,52 @@ class SerialViewerApp(QMainWindow):
         self.payload_baud.setEnabled(False)
 
         self.on_raw_data("payload", f"=== {port} BAĞLANDI ===")
+        if self.is_logging and self.rb_parsed.isChecked():
+            yollar = self._csv_yollari()
+            self.append_text(
+                f'<span style="color:#8BC34A;">[LOG] 🛰️ Görev Yükü bağlandı → '
+                f'artık {os.path.basename(yollar["payload"])} dosyasına yazılıyor.</span>')
+
+    def _teardown_worker(self, identifier):
+        """Worker'ı durdurur, sinyallerini söker ve referansı temizler.
+        Sinyalleri sökmek şart: aksi halde durdurulmakta olan worker'ın
+        gecikmeli disconnected_signal'i, hemen ardından açılan yeni bağlantıyı
+        keser (asıl 'tekrar bağlanmıyor' hatasının kaynağı)."""
+        worker = self.rocket_worker if identifier == "rocket" else self.payload_worker
+        if worker is None:
+            return
+        try:
+            worker.disconnected_signal.disconnect()
+            worker.raw_data_signal.disconnect()
+            worker.parsed_data_signal.disconnect()
+            worker.stats_signal.disconnect()
+            worker.error_signal.disconnect()
+        except (TypeError, RuntimeError):
+            # Zaten sökülmüş / silinmiş olabilir — sorun değil
+            pass
+        worker.stop()
+        worker.deleteLater()
+        if identifier == "rocket":
+            self.rocket_worker = None
+        else:
+            self.payload_worker = None
+
+    def on_worker_disconnected(self, identifier):
+        """Worker kendi kendine kesildiğinde (hata/port kopması) çağrılır.
+        Yalnızca sinyali gönderen worker HÂLÂ güncel worker ise işleme al —
+        eski bir worker'ın gecikmeli sinyali yeni bağlantıyı kesmesin."""
+        sender = self.sender()
+        guncel = self.rocket_worker if identifier == "rocket" else self.payload_worker
+        if sender is not None and sender is not guncel:
+            return
+        self.disconnect_system(identifier)
 
     def disconnect_system(self, identifier):
         if identifier == "rocket":
             # Zaten kesildiyse (ör. hem stop() hem worker sinyali tetiklendi) tekrarlama
             if self.rocket_worker is None and self.rocket_connect_btn.isEnabled():
                 return
-            if self.rocket_worker:
-                self.rocket_worker.stop()
-                self.rocket_worker = None
+            self._teardown_worker("rocket")
             self.rocket_connect_btn.setEnabled(True)
             self.rocket_disconnect_btn.setEnabled(False)
             self.rocket_cb.setEnabled(True)
@@ -1010,9 +1164,7 @@ class SerialViewerApp(QMainWindow):
         elif identifier == "payload":
             if self.payload_worker is None and self.payload_connect_btn.isEnabled():
                 return
-            if self.payload_worker:
-                self.payload_worker.stop()
-                self.payload_worker = None
+            self._teardown_worker("payload")
             self.payload_connect_btn.setEnabled(True)
             self.payload_disconnect_btn.setEnabled(False)
             self.payload_cb.setEnabled(True)
@@ -1064,7 +1216,7 @@ class SerialViewerApp(QMainWindow):
                            f"Durum:{DURUM_ETIKET.get(packet['ucus_durumu'],'?')} | "
                            f"GPS:{packet['gpsEnlem']:.4f},{packet['gpsBoylam']:.4f}")
                 if self.is_logging and self.rb_parsed.isChecked():
-                    self.write_log(f"[ROKET] PARSED: {summary}")
+                    self.write_csv_row("rocket", packet, t)
                 # Terminale parse özetini throttle'lı bas
                 if now - self._son_terminal.get("rocket_parse", 0.0) >= 0.1:
                     self._son_terminal["rocket_parse"] = now
@@ -1085,6 +1237,14 @@ class SerialViewerApp(QMainWindow):
                 self.p_press.append(packet['basinc']); self.p_t_press.append(t)
 
                 self.payload_labels["Nem (%)"].setText(f"{packet['nem']:.1f}")
+                self.p_hum.append(packet['nem']); self.p_t_hum.append(t)
+
+                # BNO055 — görev yükü artık ivme + gyro gönderiyor (roll/pitch/yaw yok)
+                self.payload_labels["İvme XYZ (m/s²)"].setText(
+                    f"{packet['ivmeX']:.2f}, {packet['ivmeY']:.2f}, {packet['ivmeZ']:.2f}")
+                self.payload_labels["Gyro XYZ (rad/s)"].setText(
+                    f"{packet['gyroX']:.2f}, {packet['gyroY']:.2f}, {packet['gyroZ']:.2f}")
+
                 self.payload_labels["GPS"].setText(f"{packet['gpsEnlem']:.5f}, {packet['gpsBoylam']:.5f}")
 
                 now = time.monotonic()
@@ -1095,9 +1255,10 @@ class SerialViewerApp(QMainWindow):
                         f"if (typeof updatePayload === 'function') updatePayload({packet['gpsEnlem']}, {packet['gpsBoylam']});")
 
                 summary = (f"Alt:{packet['irtifa']:.1f}m | Sic:{packet['bmeSicaklik']:.1f}°C | "
+                           f"Bas:{packet['basinc']:.1f}hPa | "
                            f"GPS:{packet['gpsEnlem']:.4f},{packet['gpsBoylam']:.4f}")
                 if self.is_logging and self.rb_parsed.isChecked():
-                    self.write_log(f"[G.YÜKÜ] PARSED: {summary}")
+                    self.write_csv_row("payload", packet, t)
                 if now - self._son_terminal.get("payload_parse", 0.0) >= 0.1:
                     self._son_terminal["payload_parse"] = now
                     self.append_text(f'<span style="color:#CDDC39;">  └─ [PARSE] {summary}</span>')
@@ -1108,10 +1269,54 @@ class SerialViewerApp(QMainWindow):
 
 
     def browse_log_file(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Log Dosyasını Kaydet", "", "Text Files (*.txt);;All Files (*)")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Log Dosyasını Kaydet", "",
+            "CSV Dosyaları (*.csv);;Metin Dosyaları (*.txt);;Tümü (*)")
         if file_path:
             self.log_path_input.setText(file_path)
             self.log_file_path = file_path
+
+    def _csv_yollari(self):
+        """Seçilen taban yoldan roket ve görev yükü için ayrı CSV yolları üretir.
+        Örn. 'ucus.csv' -> 'ucus_roket.csv' + 'ucus_gorevyuku.csv'."""
+        taban, uzanti = os.path.splitext(self.log_file_path)
+        if uzanti.lower() != '.csv':
+            uzanti = '.csv'
+        return {
+            'rocket': f"{taban}_roket{uzanti}",
+            'payload': f"{taban}_gorevyuku{uzanti}",
+        }
+
+    def _csv_ac(self):
+        """Kayıt başlarken kaynak başına CSV dosyasını açar, header'ı (yeni/boş
+        dosyaysa) yazar. Zaten veri varsa append eder, header tekrar yazılmaz."""
+        yollar = self._csv_yollari()
+        semalar = {'rocket': ROCKET_CSV_ALANLARI, 'payload': PAYLOAD_CSV_ALANLARI}
+        # Ayracı kayıt başında SABİTLE (kayıt ortasında değişmesin → dosya bütünlüğü).
+        # Türkçe Excel: sütun ';', ondalık ',' — aksi halde standart ',' ve '.'.
+        self._csv_tr_excel = self.cb_tr_excel.isChecked()
+        self._csv_delimiter = ';' if self._csv_tr_excel else ','
+        for identifier, yol in yollar.items():
+            try:
+                yeni = not os.path.exists(yol) or os.path.getsize(yol) == 0
+                f = open(yol, 'a', newline='', encoding='utf-8')
+                w = csv.writer(f, delimiter=self._csv_delimiter)
+                if yeni:
+                    w.writerow([sutun for sutun, _, _ in semalar[identifier]])
+                    f.flush()
+                self._csv_files[identifier] = f
+                self._csv_writers[identifier] = w
+            except Exception as e:
+                self.append_text(f'<span style="color:#F44336;">[CSV AÇMA HATASI] {yol}: {e}</span>')
+
+    def _csv_kapat(self):
+        for f in self._csv_files.values():
+            try:
+                f.flush(); f.close()
+            except Exception:
+                pass
+        self._csv_files.clear()
+        self._csv_writers.clear()
 
     def toggle_logging(self, checked):
         if checked:
@@ -1120,16 +1325,42 @@ class SerialViewerApp(QMainWindow):
                 self.log_active_btn.setChecked(False)
                 return
             self.is_logging = True
+            # Parsed mod → kaynak başına CSV dosyaları aç (header dahil)
+            if self.rb_parsed.isChecked():
+                self._csv_ac()
+                yollar = self._csv_yollari()
+                self.append_text(
+                    f'<span style="color:#FFEB3B;">[LOG] CSV kaydı başladı → 🚀 {os.path.basename(yollar["rocket"])} , '
+                    f'🛰️ {os.path.basename(yollar["payload"])}</span>')
+                # Hangi kaynaklar bağlı? Bağlı olmayan kaynağın dosyası boş kalır —
+                # kullanıcı "sadece roket logu geliyor" sanmasın, açıkça uyar.
+                roket_bagli = self.rocket_worker is not None
+                gy_bagli    = self.payload_worker is not None
+                self.append_text(
+                    f'<span style="color:#90CAF9;">[LOG] Bağlı kaynaklar: '
+                    f'🚀 Roket={"EVET" if roket_bagli else "HAYIR"} , '
+                    f'🛰️ Görev Yükü={"EVET" if gy_bagli else "HAYIR"}</span>')
+                if not roket_bagli or not gy_bagli:
+                    eksik = []
+                    if not roket_bagli: eksik.append("🚀 Roket")
+                    if not gy_bagli:    eksik.append("🛰️ Görev Yükü")
+                    self.append_text(
+                        f'<span style="color:#FF9800; font-weight:bold;">[LOG UYARI] '
+                        f'{" ve ".join(eksik)} henüz BAĞLI DEĞİL → ilgili CSV dosyası boş kalır. '
+                        f'İlgili bölümdeki yeşil "Bağlan" düğmesine bas.</span>')
+            else:
+                self.append_text(f'<span style="color:#FFEB3B;">[LOG] RAW kaydı başladı: {self.log_file_path}</span>')
             self.log_active_btn.setText("⏹ Log Kaydını Durdur")
             self.log_active_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold; padding: 10px;")
-            self.append_text(f'<span style="color:#FFEB3B;">[LOG] Kayıt başladı: {self.log_file_path}</span>')
         else:
             self.is_logging = False
+            self._csv_kapat()
             self.log_active_btn.setText("▶ Log Kaydını Başlat")
             self.log_active_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
             self.append_text('<span style="color:#FFEB3B;">[LOG] Kayıt durduruldu.</span>')
 
     def write_log(self, data_str):
+        """RAW modu: seçilen tek dosyaya düz metin satırı ekler."""
         if not self.is_logging or not self.log_file_path:
             return
         try:
@@ -1137,6 +1368,50 @@ class SerialViewerApp(QMainWindow):
                 f.write(data_str + "\n")
         except Exception as e:
             self.append_text(f'<span style="color:#F44336;">[LOG YAZMA HATASI] {e}</span>')
+
+    def write_csv_row(self, identifier, packet, t):
+        """Parsed modu: paketi, kaynağın CSV şemasına göre bir satır olarak yazar.
+        Her float alan şemada tanımlı ondalık basamağa yuvarlanır → okunaklı,
+        hizalı sütunlar ve küçük dosya (ham 17 haneli float yerine 2-7 hane).
+        Türkçe Excel modunda ondalık ayırıcı '.' yerine ',' kullanılır (yalnız
+        SAYISAL alanlarda — 'saat' alanındaki nokta korunur)."""
+        writer = self._csv_writers.get(identifier)
+        if writer is None:
+            return
+        tr = getattr(self, '_csv_tr_excel', False)  # ondalık virgül mü?
+
+        def sayi(s):
+            return s.replace('.', ',') if tr else s
+
+        semalar = {'rocket': ROCKET_CSV_ALANLARI, 'payload': PAYLOAD_CSV_ALANLARI}
+        satir = []
+        for sutun, anahtar, ondalik in semalar[identifier]:
+            if anahtar is None:
+                if sutun == 'zaman_s':
+                    satir.append(sayi(f"{t:.3f}"))
+                elif sutun == 'saat':
+                    # saat metnindeki '.' ondalık değil (sn.ms) — DÖNÜŞTÜRME
+                    satir.append(datetime.now().strftime("%H:%M:%S.%f")[:-3])
+                else:
+                    satir.append('')
+            else:
+                deger = packet.get(anahtar)
+                if isinstance(deger, bool):
+                    satir.append(int(deger))
+                elif ondalik is not None and isinstance(deger, (int, float)):
+                    # sabit ondalıkla yaz (ör. 0.20 → '0.20', 3421.5 → '3421.50')
+                    satir.append(sayi(f"{deger:.{ondalik}f}"))
+                elif deger is None:
+                    satir.append('')
+                else:
+                    satir.append(deger)
+        try:
+            writer.writerow(satir)
+            f = self._csv_files.get(identifier)
+            if f:
+                f.flush()  # güç kesintisinde son satırlar kaybolmasın
+        except Exception as e:
+            self.append_text(f'<span style="color:#F44336;">[CSV YAZMA HATASI] {e}</span>')
 
     def change_program_mode(self):
         mode = "binary" if self.rb_mode_binary.isChecked() else "string"
@@ -1171,6 +1446,8 @@ class SerialViewerApp(QMainWindow):
                 self.curve_p_temp.setData(list(self.p_t_temp), list(self.p_temp))
             if len(self.p_t_press) == len(self.p_press) and len(self.p_press) > 0:
                 self.curve_p_press.setData(list(self.p_t_press), list(self.p_press))
+            if len(self.p_t_hum) == len(self.p_hum) and len(self.p_hum) > 0:
+                self.curve_p_hum.setData(list(self.p_t_hum), list(self.p_hum))
         except Exception as e:
             # Sessizce yutma: ilk hatayı terminale bas (spam olmasın diye bir kez)
             if not self._plot_hata_gosterildi:
@@ -1188,6 +1465,7 @@ class SerialViewerApp(QMainWindow):
     def closeEvent(self, event):
         self.disconnect_system("rocket")
         self.disconnect_system("payload")
+        self._csv_kapat()  # açık CSV dosyalarını flush edip kapat
         event.accept()
 
 if __name__ == "__main__":
