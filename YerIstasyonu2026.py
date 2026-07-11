@@ -62,22 +62,25 @@ from collections import deque
 # Kaynak: UcusYazilimi/src/main.cpp (TelemetryWire) ve
 #         UcusYazilimi/GorevYukuYazilimi/gorevyuku.cpp (GorevYukuWire)
 # FIXED-POINT WIRE FORMAT (paket kucultme): firmware float -> packed int quantize.
-# Roket TelemetryWire (23B): ivmeZ, roll, pitch (3x int16), yaw (uint16),
+# Roket TelemetryWire (23B): ivmeToplam, roll, pitch (3x int16), yaw (uint16),
 #   irtifa, dikeyHiz, eglim (3x int16), gpsEnlem, gpsBoylam (2x int32),
 #   durum (uint8 bitfield). Olcekler asagidaki WIRE_OLCEK_* ile ters cevrilir.
-# NOT: ivmeX/ivmeY ve gyroX/Y/Z havadan GONDERILMEZ (yer istasyoninda gosterilmiyordu;
-#      roketin SD kartinda tam float kayitli). Hiz artisi (>10 Hz) icin cikarildi.
+# NOT: ivmeX/Y/Z tek tek havadan GONDERILMEZ; yerine bileske (toplam) ivme
+#      buyuklugu sqrt(x^2+y^2+z^2) tek int16 slot ile gelir (byte duzeni AYNI).
+#      Ham 3 eksen + gyro roketin SD kartinda tam float kayitli.
 ROCKET_PACKET_FORMAT = '<3hH3h2iB'
 ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 23 byte
 ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 28 byte
 
-# GorevYukuWire (28B): basinc (uint16 hPa x10), sicaklik (int16 x100),
+# GorevYukuWire (24B): basinc (uint16 hPa x10), sicaklik (int16 x100),
 #   nem (uint16 x100), irtifa (int16 x10), gpsEnlem/gpsBoylam (2x int32 x1e7),
-#   ivmeX/Y/Z (3x int16 x100), gyroX/Y/Z (3x int16 x10).
-# NOT: BNO055'ten yalnız ivme + gyro gönderilir; roll/pitch/yaw ve uçuş durumu GÖNDERİLMEZ.
-PAYLOAD_PACKET_FORMAT = '<HhHh2i6h'
-PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 28 byte
-PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 33 byte
+#   ivmeToplam (int16 x100), gyroX/Y/Z (3x int16 x10).
+# NOT: ivmeX/Y/Z tek tek GONDERILMEZ; yerine bileske (toplam) ivme buyuklugu
+#      sqrt(x^2+y^2+z^2) tek int16 slot ile gelir (28B->24B). Ham 3 eksen SD'de.
+#      BNO055'ten yalniz (toplam) ivme + gyro gonderilir; roll/pitch/yaw GONDERILMEZ.
+PAYLOAD_PACKET_FORMAT = '<HhHh2i4h'
+PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 24 byte
+PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 29 byte
 
 # --- FIXED-POINT OLCEKLER (firmware ile birebir; ters cevirmek icin bolunur) ---
 WIRE_OLCEK_IVME   = 100.0
@@ -106,7 +109,7 @@ SYNC_1, SYNC_2 = 0xAA, 0x55
 ROCKET_CSV_ALANLARI = [
     ('zaman_s', None, 3), ('saat', None, None),
     ('irtifa_m', 'irtifa', 2), ('dikeyHiz_ms', 'dikeyHiz', 2), ('eglim_derece', 'eglimAcisi', 2),
-    ('ivmeZ', 'ivmeZ', 3),   # ivmeX/ivmeY ve gyro havadan gelmiyor (SD'de tam kayitli)
+    ('ivmeToplam', 'ivmeToplam', 3),   # bileske ivme; ham eksenler+gyro havadan gelmiyor (SD'de tam kayitli)
     ('roll', 'roll', 2), ('pitch', 'pitch', 2), ('yaw', 'yaw', 2),
     ('gpsEnlem', 'gpsEnlem', 7), ('gpsBoylam', 'gpsBoylam', 7),
     ('ayrilma1', 'ayrilma1_durum', None), ('ayrilma2', 'ayrilma2_durum', None),
@@ -116,7 +119,7 @@ PAYLOAD_CSV_ALANLARI = [
     ('zaman_s', None, 3), ('saat', None, None),
     ('basinc_hPa', 'basinc', 2), ('sicaklik_C', 'bmeSicaklik', 2), ('nem_pct', 'nem', 2),
     ('irtifa_m', 'irtifa', 2), ('gpsEnlem', 'gpsEnlem', 7), ('gpsBoylam', 'gpsBoylam', 7),
-    ('ivmeX', 'ivmeX', 3), ('ivmeY', 'ivmeY', 3), ('ivmeZ', 'ivmeZ', 3),
+    ('ivmeToplam', 'ivmeToplam', 3),   # bileske ivme; ham eksenler havadan gelmiyor (SD'de tam kayitli)
     ('gyroX', 'gyroX', 3), ('gyroY', 'gyroY', 3), ('gyroZ', 'gyroZ', 3),
 ]
 
@@ -147,7 +150,7 @@ def parse_rocket_frame(raw: bytes):
     v = struct.unpack(ROCKET_PACKET_FORMAT, payload)
     durum = v[9]   # '<3hH3h2iB' -> 10 deger: v[9] = durum bitfield byte
     return {
-        'ivmeZ': v[0] / WIRE_OLCEK_IVME,   # yalniz Z (ivmeX/ivmeY havadan gelmiyor)
+        'ivmeToplam': v[0] / WIRE_OLCEK_IVME,   # bileske ivme sqrt(x^2+y^2+z^2) (ham eksenler havadan gelmiyor)
         'roll':  v[1] / WIRE_OLCEK_ACI,  'pitch': v[2] / WIRE_OLCEK_ACI,  'yaw': v[3] / WIRE_OLCEK_ACI,
         'irtifa':     v[4] / WIRE_OLCEK_IRTIFA,
         'dikeyHiz':   v[5] / WIRE_OLCEK_HIZ,
@@ -174,8 +177,8 @@ def parse_payload_frame(raw: bytes):
         'irtifa':      v[3] / WIRE_OLCEK_IRTIFA,
         'gpsEnlem':    v[4] / WIRE_OLCEK_GPS,
         'gpsBoylam':   v[5] / WIRE_OLCEK_GPS,
-        'ivmeX': v[6] / WIRE_OLCEK_IVME, 'ivmeY': v[7] / WIRE_OLCEK_IVME, 'ivmeZ': v[8] / WIRE_OLCEK_IVME,
-        'gyroX': v[9] / WIRE_OLCEK_GYRO, 'gyroY': v[10] / WIRE_OLCEK_GYRO, 'gyroZ': v[11] / WIRE_OLCEK_GYRO,
+        'ivmeToplam': v[6] / WIRE_OLCEK_IVME,   # bileske ivme (ham eksenler havadan gelmiyor)
+        'gyroX': v[7] / WIRE_OLCEK_GYRO, 'gyroY': v[8] / WIRE_OLCEK_GYRO, 'gyroZ': v[9] / WIRE_OLCEK_GYRO,
     }
 
 # (String modu tamamen kaldırıldı)
@@ -439,9 +442,9 @@ class SerialWorker(QThread):
 
             if self.identifier == "rocket":
                 # Firmware quantize esdegeri: float -> packed int (paket kucultme, clamp'li)
-                # ivmeX/ivmeY ve gyro havadan gitmiyor -> yalniz ivmeZ.
+                # ivmeX/Y/Z tek tek gitmiyor -> yalniz bileske (toplam) ivme.
                 payload = struct.pack(ROCKET_PACKET_FORMAT,
-                    _qi16(acc * WIRE_OLCEK_IVME),                           # ivmeZ x100
+                    _qi16(acc * WIRE_OLCEK_IVME),                           # ivmeToplam x100
                     _qi16(r * WIRE_OLCEK_ACI), _qi16(p * WIRE_OLCEK_ACI),   # roll,pitch x100
                     _qu16((yaw_a % 360) * WIRE_OLCEK_ACI),                  # yaw x100 (uint16)
                     _qi16(sent_alt * WIRE_OLCEK_IRTIFA),                    # irtifa x10
@@ -457,9 +460,9 @@ class SerialWorker(QThread):
                     self.raw_data_signal.emit(self.identifier, frame.hex())
                     self.parsed_data_signal.emit(self.identifier, packet, t)
             else:
-                # GorevYukuWire (28B): BME280(basinc,sicaklik,nem,irtifa) + GPS
-                #  + BNO055 ivme(X,Y,Z) + gyro(X,Y,Z). roll/pitch/yaw göndermez.
-                gy_ivmeZ = acc
+                # GorevYukuWire (24B): BME280(basinc,sicaklik,nem,irtifa) + GPS
+                #  + BNO055 bileske ivme + gyro(X,Y,Z). roll/pitch/yaw göndermez.
+                gy_ivmeToplam = abs(acc)   # bileske ivme buyuklugu (>=0)
                 basinc_hpa = 1013.25 - sent_alt * 0.12
                 sicaklik_c = 25.0 - sent_alt * 0.006
                 payload = struct.pack(PAYLOAD_PACKET_FORMAT,
@@ -468,7 +471,7 @@ class SerialWorker(QThread):
                     _qu16(45.0 * WIRE_OLCEK_NEM),                          # nem x100 (uint16)
                     _qi16(sent_alt * WIRE_OLCEK_IRTIFA),                    # irtifa x10
                     _qi32(lat * WIRE_OLCEK_GPS), _qi32(lon * WIRE_OLCEK_GPS),  # gps x1e7
-                    0, 0, _qi16(gy_ivmeZ * WIRE_OLCEK_IVME),                # ivme x100
+                    _qi16(gy_ivmeToplam * WIRE_OLCEK_IVME),                 # ivmeToplam x100
                     0, 0, 0                                                  # gyro x10
                 )
                 crc = crc16_ccitt(payload)
@@ -766,7 +769,7 @@ class SerialViewerApp(QMainWindow):
         self.rocket_labels = {
             "İrtifa (m)":      QLabel("-"),
             "Dikey Hız (m/s)": QLabel("-"),
-            "İvme Z (m/s²)":   QLabel("-"),
+            "Toplam İvme (m/s²)": QLabel("-"),
             "Eğim Açısı (°)":  QLabel("-"),
             "Durum":           QLabel("-"),
             "GPS":             QLabel("-"),
@@ -819,7 +822,7 @@ class SerialViewerApp(QMainWindow):
             "Sıcaklık (°C)":    QLabel("-"),
             "Basınç (hPa)":     QLabel("-"),
             "Nem (%)":          QLabel("-"),
-            "İvme XYZ (m/s²)":  QLabel("-"),
+            "Toplam İvme (m/s²)": QLabel("-"),
             "Gyro XYZ (rad/s)": QLabel("-"),
             "GPS":              QLabel("-"),
             "Paket (OK/Hata)":  QLabel("-"),
@@ -1231,8 +1234,8 @@ class SerialViewerApp(QMainWindow):
                 self.rocket_labels["Dikey Hız (m/s)"].setText(f"{packet['dikeyHiz']:.2f}")
                 self.r_vel.append(packet['dikeyHiz']); self.r_t_vel.append(t)
  
-                self.rocket_labels["İvme Z (m/s²)"].setText(f"{packet['ivmeZ']:.2f}")
-                self.r_acc.append(packet['ivmeZ']); self.r_t_acc.append(t)
+                self.rocket_labels["Toplam İvme (m/s²)"].setText(f"{packet['ivmeToplam']:.2f}")
+                self.r_acc.append(packet['ivmeToplam']); self.r_t_acc.append(t)
  
                 self.rocket_labels["Eğim Açısı (°)"].setText(f"{packet['eglimAcisi']:.1f}")
                 self.rocket_labels["Durum"].setText(DURUM_ETIKET.get(packet['ucus_durumu'], '?'))
@@ -1277,9 +1280,8 @@ class SerialViewerApp(QMainWindow):
                 self.payload_labels["Nem (%)"].setText(f"{packet['nem']:.1f}")
                 self.p_hum.append(packet['nem']); self.p_t_hum.append(t)
 
-                # BNO055 — görev yükü artık ivme + gyro gönderiyor (roll/pitch/yaw yok)
-                self.payload_labels["İvme XYZ (m/s²)"].setText(
-                    f"{packet['ivmeX']:.2f}, {packet['ivmeY']:.2f}, {packet['ivmeZ']:.2f}")
+                # BNO055 — görev yükü artık bileske ivme + gyro gönderiyor (roll/pitch/yaw yok)
+                self.payload_labels["Toplam İvme (m/s²)"].setText(f"{packet['ivmeToplam']:.2f}")
                 self.payload_labels["Gyro XYZ (rad/s)"].setText(
                     f"{packet['gyroX']:.2f}, {packet['gyroY']:.2f}, {packet['gyroZ']:.2f}")
 
