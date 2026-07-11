@@ -11,7 +11,8 @@
 #  (Firmware fixed-point wire format ile birebir — bkz. lora-wire-fixed-point.)
 #
 #  Kullanim:
-#     python3 hz_olcer.py <port> [baud=9600]
+#     python3 hz_olcer.py                 -> portlari listeler ve SORAR
+#     python3 hz_olcer.py <port> [baud=9600]   -> dogrudan verilebilir
 #     python3 hz_olcer.py /dev/tty.usbserial-0001
 #     python3 hz_olcer.py COM5 9600
 #
@@ -80,18 +81,41 @@ def cerceveleri_ayikla(buf: bytearray):
     return sonuc
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Kullanim: python3 hz_olcer.py <port> [baud=9600]")
+def port_sec():
+    """Kullanilabilir seri portlari listeler ve kullaniciya sordurur."""
+    from serial.tools import list_ports
+    portlar = list(list_ports.comports())
+    if not portlar:
+        print("HATA: hic seri port bulunamadi. Cihaz takili mi?")
         sys.exit(1)
+    print("Kullanilabilir portlar:")
+    for i, p in enumerate(portlar):
+        aciklama = ""
+        if p.description and p.description.lower() != "n/a":
+            aciklama = f"  ({p.description})"
+        print(f"  [{i}] {p.device}{aciklama}")
+    while True:
+        secim = input("Hangi port? (numara ya da tam port adi): ").strip()
+        if not secim:
+            continue
+        if secim.isdigit():
+            idx = int(secim)
+            if 0 <= idx < len(portlar):
+                return portlar[idx].device
+            print("  Gecersiz numara, tekrar dene.")
+            continue
+        return secim  # dogrudan port adi da girilebilir
 
+
+def main():
     try:
         import serial  # pyserial (yer istasyonu da bunu kullaniyor)
     except ImportError:
         print("HATA: pyserial yok. Kur:  pip install pyserial")
         sys.exit(1)
 
-    port = sys.argv[1]
+    # Port: komut satirindan verildiyse onu kullan, yoksa acilista SOR.
+    port = sys.argv[1] if len(sys.argv) > 1 else port_sec()
     baud = int(sys.argv[2]) if len(sys.argv) > 2 else 9600
 
     try:
