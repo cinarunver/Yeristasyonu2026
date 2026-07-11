@@ -59,20 +59,39 @@ from datetime import datetime
 from collections import deque
 
 # --- PAKET SABİTLERİ ---
-# Kaynak: UcusYazilimi/src/main.cpp (TelemetryPacket) ve
-#         UcusYazilimi/GorevYukuYazilimi/gorevyuku.cpp (GorevYukuPaket)
-ROCKET_PACKET_FORMAT = '<14f3B'
-ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 59 byte
-ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 64 byte
+# Kaynak: UcusYazilimi/src/main.cpp (TelemetryWire) ve
+#         UcusYazilimi/GorevYukuYazilimi/gorevyuku.cpp (GorevYukuWire)
+# FIXED-POINT WIRE FORMAT (paket kucultme): firmware float -> packed int quantize.
+# Roket TelemetryWire (33B): ivmeX/Y/Z, gyroX/Y/Z, roll, pitch (8x int16),
+#   yaw (uint16), irtifa, dikeyHiz, eglim (3x int16), gpsEnlem, gpsBoylam
+#   (2x int32), durum (uint8 bitfield). Olcekler asagidaki WIRE_OLCEK_* ile ters cevrilir.
+ROCKET_PACKET_FORMAT = '<8hH3h2iB'
+ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 33 byte
+ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 38 byte
 
-# GorevYukuPaket (gorevyuku.cpp, #pragma pack(1)): BME280 + GPS + BNO055
-#   basinc(hPa), sicaklik(°C), nem(%), irtifa(m), gpsEnlem, gpsBoylam,
-#   ivmeX, ivmeY, ivmeZ (m/s²), gyroX, gyroY, gyroZ (rad/s)
-# NOT: BNO055'ten yalnız ivme + gyro gönderilir; roll/pitch/yaw ve uçuş durumu
-#      GÖNDERİLMEZ. Firmware struct'ı 12 float (48 byte).
-PAYLOAD_PACKET_FORMAT = '<12f'  # 12 float (packed, padding yok)
-PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 48 byte
-PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 53 byte
+# GorevYukuWire (28B): basinc (uint16 hPa x10), sicaklik (int16 x100),
+#   nem (uint16 x100), irtifa (int16 x10), gpsEnlem/gpsBoylam (2x int32 x1e7),
+#   ivmeX/Y/Z (3x int16 x100), gyroX/Y/Z (3x int16 x10).
+# NOT: BNO055'ten yalnız ivme + gyro gönderilir; roll/pitch/yaw ve uçuş durumu GÖNDERİLMEZ.
+PAYLOAD_PACKET_FORMAT = '<HhHh2i6h'
+PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 28 byte
+PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 33 byte
+
+# --- FIXED-POINT OLCEKLER (firmware ile birebir; ters cevirmek icin bolunur) ---
+WIRE_OLCEK_IVME   = 100.0
+WIRE_OLCEK_GYRO   = 10.0
+WIRE_OLCEK_ACI    = 100.0
+WIRE_OLCEK_IRTIFA = 10.0
+WIRE_OLCEK_HIZ    = 10.0
+WIRE_OLCEK_GPS    = 1e7
+WIRE_OLCEK_BASINC = 10.0    # hPa x10
+WIRE_OLCEK_SICAK  = 100.0
+WIRE_OLCEK_NEM    = 100.0
+
+# Firmware q16/qu16/q32 ile birebir clamp (simulasyon paketleme overflow'unu onler).
+def _qi16(x): return max(-32768, min(32767, int(round(x))))
+def _qu16(x): return max(0, min(65535, int(round(x))))
+def _qi32(x): return max(-2147483648, min(2147483647, int(round(x))))
 
 SYNC_1, SYNC_2 = 0xAA, 0x55
 
@@ -125,16 +144,19 @@ def parse_rocket_frame(raw: bytes):
     crc_recv = (raw[3 + ROCKET_PACKET_SIZE] << 8) | raw[3 + ROCKET_PACKET_SIZE + 1]
     if crc16_ccitt(payload) != crc_recv: return None
     v = struct.unpack(ROCKET_PACKET_FORMAT, payload)
+    durum = v[14]   # '<8hH3h2iB' -> 15 deger: v[14] = durum bitfield byte
     return {
-        'ivmeX': v[0],  'ivmeY': v[1],  'ivmeZ': v[2],
-        'gyroX': v[3],  'gyroY': v[4],  'gyroZ': v[5],
-        'roll':  v[6],  'pitch': v[7],  'yaw':   v[8],
-        'irtifa': v[9],
-        'dikeyHiz': v[10], 'eglimAcisi': v[11],
-        'gpsEnlem': v[12], 'gpsBoylam': v[13],
-        'ayrilma1_durum': bool(v[14]),
-        'ayrilma2_durum': bool(v[15]),
-        'ucus_durumu':    v[16],
+        'ivmeX': v[0] / WIRE_OLCEK_IVME, 'ivmeY': v[1] / WIRE_OLCEK_IVME, 'ivmeZ': v[2] / WIRE_OLCEK_IVME,
+        'gyroX': v[3] / WIRE_OLCEK_GYRO, 'gyroY': v[4] / WIRE_OLCEK_GYRO, 'gyroZ': v[5] / WIRE_OLCEK_GYRO,
+        'roll':  v[6] / WIRE_OLCEK_ACI,  'pitch': v[7] / WIRE_OLCEK_ACI,  'yaw':   v[8] / WIRE_OLCEK_ACI,
+        'irtifa':     v[9]  / WIRE_OLCEK_IRTIFA,
+        'dikeyHiz':   v[10] / WIRE_OLCEK_HIZ,
+        'eglimAcisi': v[11] / WIRE_OLCEK_ACI,
+        'gpsEnlem':   v[12] / WIRE_OLCEK_GPS,
+        'gpsBoylam':  v[13] / WIRE_OLCEK_GPS,
+        'ayrilma1_durum': bool(durum & 0x01),
+        'ayrilma2_durum': bool(durum & 0x02),
+        'ucus_durumu':    (durum >> 2) & 0x07,
     }
 
 def parse_payload_frame(raw: bytes):
@@ -146,10 +168,14 @@ def parse_payload_frame(raw: bytes):
     if crc16_ccitt(payload) != crc_recv: return None
     v = struct.unpack(PAYLOAD_PACKET_FORMAT, payload)
     return {
-        'basinc': v[0], 'bmeSicaklik': v[1], 'nem': v[2], 'irtifa': v[3],
-        'gpsEnlem': v[4], 'gpsBoylam': v[5],
-        'ivmeX': v[6], 'ivmeY': v[7], 'ivmeZ': v[8],
-        'gyroX': v[9], 'gyroY': v[10], 'gyroZ': v[11],
+        'basinc':      v[0] / WIRE_OLCEK_BASINC,   # hPa
+        'bmeSicaklik': v[1] / WIRE_OLCEK_SICAK,
+        'nem':         v[2] / WIRE_OLCEK_NEM,
+        'irtifa':      v[3] / WIRE_OLCEK_IRTIFA,
+        'gpsEnlem':    v[4] / WIRE_OLCEK_GPS,
+        'gpsBoylam':   v[5] / WIRE_OLCEK_GPS,
+        'ivmeX': v[6] / WIRE_OLCEK_IVME, 'ivmeY': v[7] / WIRE_OLCEK_IVME, 'ivmeZ': v[8] / WIRE_OLCEK_IVME,
+        'gyroX': v[9] / WIRE_OLCEK_GYRO, 'gyroY': v[10] / WIRE_OLCEK_GYRO, 'gyroZ': v[11] / WIRE_OLCEK_GYRO,
     }
 
 # (String modu tamamen kaldırıldı)
@@ -412,13 +438,17 @@ class SerialWorker(QThread):
             sent_alt = alt
 
             if self.identifier == "rocket":
+                # Firmware quantize esdegeri: float -> packed int (paket kucultme, clamp'li)
                 payload = struct.pack(ROCKET_PACKET_FORMAT,
-                    0.0, 0.0, acc,
-                    0.0, 0.0, 0.0,
-                    r, p, yaw_a,
-                    sent_alt, vel, abs(p % 90),
-                    lat, lon,
-                    ayrilma1, ayrilma2, ucus_durumu
+                    0, 0, _qi16(acc * WIRE_OLCEK_IVME),                      # ivme x100
+                    0, 0, 0,                                                # gyro x10
+                    _qi16(r * WIRE_OLCEK_ACI), _qi16(p * WIRE_OLCEK_ACI),   # roll,pitch x100
+                    _qu16((yaw_a % 360) * WIRE_OLCEK_ACI),                  # yaw x100 (uint16)
+                    _qi16(sent_alt * WIRE_OLCEK_IRTIFA),                    # irtifa x10
+                    _qi16(vel * WIRE_OLCEK_HIZ),                            # dikeyHiz x10
+                    _qi16((p % 90) * WIRE_OLCEK_ACI),                       # eglim x100
+                    _qi32(lat * WIRE_OLCEK_GPS), _qi32(lon * WIRE_OLCEK_GPS),  # gps x1e7
+                    (int(ayrilma1) & 1) | ((int(ayrilma2) & 1) << 1) | ((int(ucus_durumu) & 0x07) << 2)
                 )
                 crc = crc16_ccitt(payload)
                 frame = bytes([SYNC_1, SYNC_2, ROCKET_PACKET_SIZE]) + payload + bytes([(crc>>8)&0xFF, crc&0xFF])
@@ -427,15 +457,19 @@ class SerialWorker(QThread):
                     self.raw_data_signal.emit(self.identifier, frame.hex())
                     self.parsed_data_signal.emit(self.identifier, packet, t)
             else:
-                # GorevYukuPaket (12 float): BME280(basinc,sicaklik,nem,irtifa) + GPS
+                # GorevYukuWire (28B): BME280(basinc,sicaklik,nem,irtifa) + GPS
                 #  + BNO055 ivme(X,Y,Z) + gyro(X,Y,Z). roll/pitch/yaw göndermez.
                 gy_ivmeZ = acc
+                basinc_hpa = 1013.25 - sent_alt * 0.12
+                sicaklik_c = 25.0 - sent_alt * 0.006
                 payload = struct.pack(PAYLOAD_PACKET_FORMAT,
-                    1013.25 - sent_alt * 0.12, 25.0 - sent_alt * 0.006,
-                    45.0, sent_alt,
-                    lat, lon,
-                    0.0, 0.0, gy_ivmeZ,
-                    0.0, 0.0, 0.0
+                    _qu16(basinc_hpa * WIRE_OLCEK_BASINC),                  # basinc hPa x10 (uint16)
+                    _qi16(sicaklik_c * WIRE_OLCEK_SICAK),                   # sicaklik x100
+                    _qu16(45.0 * WIRE_OLCEK_NEM),                          # nem x100 (uint16)
+                    _qi16(sent_alt * WIRE_OLCEK_IRTIFA),                    # irtifa x10
+                    _qi32(lat * WIRE_OLCEK_GPS), _qi32(lon * WIRE_OLCEK_GPS),  # gps x1e7
+                    0, 0, _qi16(gy_ivmeZ * WIRE_OLCEK_IVME),                # ivme x100
+                    0, 0, 0                                                  # gyro x10
                 )
                 crc = crc16_ccitt(payload)
                 frame = bytes([SYNC_1, SYNC_2, PAYLOAD_PACKET_SIZE]) + payload + bytes([(crc>>8)&0xFF, crc&0xFF])
