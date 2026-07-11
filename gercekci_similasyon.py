@@ -103,8 +103,8 @@ def run_simulation():
             pitch = (pitch + random.uniform(15.0, 45.0)) % 360 
             yaw = (yaw + random.uniform(20.0, 60.0)) % 360
             
-            # İrtifa saçmalaması (Gerçek fizik etkilenmez, sadece ekrana giden bozuk)
-            sent_altitude = altitude + random.uniform(-800.0, 800.0)
+            # İrtifa saçmalaması kaldırıldı (gerçek fiziksel irtifa doğrudan gönderilir)
+            sent_altitude = altitude
 
             # --- PAKETLEME (Binary Struct) ---
             # Format: 14 float + 3 uint8 (UKB Formatı)
@@ -112,10 +112,10 @@ def run_simulation():
             # irtifa, dikeyHiz, eglimAcisi, gpsLat, gpsLon,
             # ayrilma1, ayrilma2, ucusDurumu
             payload = struct.pack(PACKET_FORMAT,
-                random.uniform(-0.1, 0.1), random.uniform(-0.1, 0.1), acceleration_z, # Ivme (G)
-                random.uniform(-1, 1), random.uniform(-1, 1), random.uniform(-1, 1),    # Gyro
+                0.0, 0.0, acceleration_z, # Ivme (G) - gürültüsüz
+                0.0, 0.0, 0.0,            # Gyro - gürültüsüz
                 roll, pitch, yaw,
-                sent_altitude, velocity, abs(pitch), # Saçmalayan İrtifa, Dikey Hız, Eğim Açısı
+                sent_altitude, velocity, abs(pitch), # İrtifa, Dikey Hız, Eğim Açısı
                 lat, lon,
                 ayrilma1, ayrilma2, ucus_durumu
             )

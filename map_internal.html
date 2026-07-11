@@ -4,8 +4,8 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="assets/leaflet.css"/>
+    <script src="assets/leaflet.js"></script>
     <style> 
         body { margin: 0; padding: 0; background-color: #000; } 
         #map { height: 100vh; width: 100vw; background: #000; } 
@@ -16,20 +16,39 @@
     <script>
         var map = L.map('map').setView([38.835, 33.393], 5);
         
-        // Profesyonel Siyah Harita (CartoDB Dark Matter - Engel yemez)
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
+        // 1. Harita Katmanları (Base Layers)
+        var darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
             maxZoom: 19, attribution: '© OpenStreetMap © CartoDB'
-        }).addTo(map);
+        });
+
+        var topoLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
+            maxZoom: 19, attribution: 'Tiles © Esri'
+        });
+
+        var satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            maxZoom: 19, attribution: 'Tiles © Esri'
+        });
+
+        // Varsayılan olarak Koyu Katmanı ekle
+        darkLayer.addTo(map);
+
+        // Katman Seçim Kontrolü (Layer Switcher Pop-up)
+        var baseMaps = {
+            "Koyu Harita": darkLayer,
+            "Karasal Harita": topoLayer,
+            "Uydu Haritası": satelliteLayer
+        };
+        L.control.layers(baseMaps, null, { position: 'topright' }).addTo(map);
 
         var rocketIcon = L.icon({
-            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png',
-            shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+            iconUrl: 'assets/marker-icon-2x-blue.png',
+            shadowUrl: 'assets/marker-shadow.png',
             iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
         });
 
         var payloadIcon = L.icon({
-            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-orange.png',
-            shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+            iconUrl: 'assets/marker-icon-2x-orange.png',
+            shadowUrl: 'assets/marker-shadow.png',
             iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
         });
 
