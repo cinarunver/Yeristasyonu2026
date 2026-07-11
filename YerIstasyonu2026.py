@@ -62,12 +62,14 @@ from collections import deque
 # Kaynak: UcusYazilimi/src/main.cpp (TelemetryWire) ve
 #         UcusYazilimi/GorevYukuYazilimi/gorevyuku.cpp (GorevYukuWire)
 # FIXED-POINT WIRE FORMAT (paket kucultme): firmware float -> packed int quantize.
-# Roket TelemetryWire (33B): ivmeX/Y/Z, gyroX/Y/Z, roll, pitch (8x int16),
-#   yaw (uint16), irtifa, dikeyHiz, eglim (3x int16), gpsEnlem, gpsBoylam
-#   (2x int32), durum (uint8 bitfield). Olcekler asagidaki WIRE_OLCEK_* ile ters cevrilir.
-ROCKET_PACKET_FORMAT = '<8hH3h2iB'
-ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 33 byte
-ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 38 byte
+# Roket TelemetryWire (23B): ivmeZ, roll, pitch (3x int16), yaw (uint16),
+#   irtifa, dikeyHiz, eglim (3x int16), gpsEnlem, gpsBoylam (2x int32),
+#   durum (uint8 bitfield). Olcekler asagidaki WIRE_OLCEK_* ile ters cevrilir.
+# NOT: ivmeX/ivmeY ve gyroX/Y/Z havadan GONDERILMEZ (yer istasyoninda gosterilmiyordu;
+#      roketin SD kartinda tam float kayitli). Hiz artisi (>10 Hz) icin cikarildi.
+ROCKET_PACKET_FORMAT = '<3hH3h2iB'
+ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 23 byte
+ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 28 byte
 
 # GorevYukuWire (28B): basinc (uint16 hPa x10), sicaklik (int16 x100),
 #   nem (uint16 x100), irtifa (int16 x10), gpsEnlem/gpsBoylam (2x int32 x1e7),
@@ -104,8 +106,7 @@ SYNC_1, SYNC_2 = 0xAA, 0x55
 ROCKET_CSV_ALANLARI = [
     ('zaman_s', None, 3), ('saat', None, None),
     ('irtifa_m', 'irtifa', 2), ('dikeyHiz_ms', 'dikeyHiz', 2), ('eglim_derece', 'eglimAcisi', 2),
-    ('ivmeX', 'ivmeX', 3), ('ivmeY', 'ivmeY', 3), ('ivmeZ', 'ivmeZ', 3),
-    ('gyroX', 'gyroX', 3), ('gyroY', 'gyroY', 3), ('gyroZ', 'gyroZ', 3),
+    ('ivmeZ', 'ivmeZ', 3),   # ivmeX/ivmeY ve gyro havadan gelmiyor (SD'de tam kayitli)
     ('roll', 'roll', 2), ('pitch', 'pitch', 2), ('yaw', 'yaw', 2),
     ('gpsEnlem', 'gpsEnlem', 7), ('gpsBoylam', 'gpsBoylam', 7),
     ('ayrilma1', 'ayrilma1_durum', None), ('ayrilma2', 'ayrilma2_durum', None),
@@ -144,16 +145,15 @@ def parse_rocket_frame(raw: bytes):
     crc_recv = (raw[3 + ROCKET_PACKET_SIZE] << 8) | raw[3 + ROCKET_PACKET_SIZE + 1]
     if crc16_ccitt(payload) != crc_recv: return None
     v = struct.unpack(ROCKET_PACKET_FORMAT, payload)
-    durum = v[14]   # '<8hH3h2iB' -> 15 deger: v[14] = durum bitfield byte
+    durum = v[9]   # '<3hH3h2iB' -> 10 deger: v[9] = durum bitfield byte
     return {
-        'ivmeX': v[0] / WIRE_OLCEK_IVME, 'ivmeY': v[1] / WIRE_OLCEK_IVME, 'ivmeZ': v[2] / WIRE_OLCEK_IVME,
-        'gyroX': v[3] / WIRE_OLCEK_GYRO, 'gyroY': v[4] / WIRE_OLCEK_GYRO, 'gyroZ': v[5] / WIRE_OLCEK_GYRO,
-        'roll':  v[6] / WIRE_OLCEK_ACI,  'pitch': v[7] / WIRE_OLCEK_ACI,  'yaw':   v[8] / WIRE_OLCEK_ACI,
-        'irtifa':     v[9]  / WIRE_OLCEK_IRTIFA,
-        'dikeyHiz':   v[10] / WIRE_OLCEK_HIZ,
-        'eglimAcisi': v[11] / WIRE_OLCEK_ACI,
-        'gpsEnlem':   v[12] / WIRE_OLCEK_GPS,
-        'gpsBoylam':  v[13] / WIRE_OLCEK_GPS,
+        'ivmeZ': v[0] / WIRE_OLCEK_IVME,   # yalniz Z (ivmeX/ivmeY havadan gelmiyor)
+        'roll':  v[1] / WIRE_OLCEK_ACI,  'pitch': v[2] / WIRE_OLCEK_ACI,  'yaw': v[3] / WIRE_OLCEK_ACI,
+        'irtifa':     v[4] / WIRE_OLCEK_IRTIFA,
+        'dikeyHiz':   v[5] / WIRE_OLCEK_HIZ,
+        'eglimAcisi': v[6] / WIRE_OLCEK_ACI,
+        'gpsEnlem':   v[7] / WIRE_OLCEK_GPS,
+        'gpsBoylam':  v[8] / WIRE_OLCEK_GPS,
         'ayrilma1_durum': bool(durum & 0x01),
         'ayrilma2_durum': bool(durum & 0x02),
         'ucus_durumu':    (durum >> 2) & 0x07,
@@ -439,9 +439,9 @@ class SerialWorker(QThread):
 
             if self.identifier == "rocket":
                 # Firmware quantize esdegeri: float -> packed int (paket kucultme, clamp'li)
+                # ivmeX/ivmeY ve gyro havadan gitmiyor -> yalniz ivmeZ.
                 payload = struct.pack(ROCKET_PACKET_FORMAT,
-                    0, 0, _qi16(acc * WIRE_OLCEK_IVME),                      # ivme x100
-                    0, 0, 0,                                                # gyro x10
+                    _qi16(acc * WIRE_OLCEK_IVME),                           # ivmeZ x100
                     _qi16(r * WIRE_OLCEK_ACI), _qi16(p * WIRE_OLCEK_ACI),   # roll,pitch x100
                     _qu16((yaw_a % 360) * WIRE_OLCEK_ACI),                  # yaw x100 (uint16)
                     _qi16(sent_alt * WIRE_OLCEK_IRTIFA),                    # irtifa x10

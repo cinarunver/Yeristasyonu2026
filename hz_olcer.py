@@ -7,7 +7,7 @@
 #  her saniye "kac Hz veri aliyoruz" bilgisini yazar.
 #
 #  Cerceve: [0xAA][0x55][LEN][payload LEN byte][CRC16_HI][CRC16_LO]
-#  LEN byte'indan tip otomatik ayrilir:  roket=33,  gorev yuku=28.
+#  LEN byte'indan tip otomatik ayrilir:  roket=23,  gorev yuku=28.
 #  (Firmware fixed-point wire format ile birebir — bkz. lora-wire-fixed-point.)
 #
 #  Kullanim:
@@ -23,7 +23,7 @@ import sys
 import time
 
 SYNC_1, SYNC_2 = 0xAA, 0x55
-ROCKET_LEN  = 33   # TelemetryWire
+ROCKET_LEN  = 23   # TelemetryWire (ivmeX/Y + gyro cikarildi)
 PAYLOAD_LEN = 28   # GorevYukuWire
 MAX_LEN     = 64   # guvenlik ust siniri (sahte SYNC'leri elemek icin)
 
