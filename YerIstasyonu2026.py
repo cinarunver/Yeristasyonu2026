@@ -35,15 +35,31 @@
 # - Buffer taşma koruması kuyruk koruyacak şekilde düzeltildi.
 # - Varsayılan baud 9600 (E32 LoRa alıcısı); update_plots hatası görünür.
 # - Lokal Loglama (TXT kaydı, commit 412d250)
+# --- ✓ YAPILDI (2026-07-29 — hava yoğunluğu + gerçek zamanlı yönelim illüstrasyonu) ---
+# - DÜZELTME: roket paketi quaternion'ı Euler sanıyordu. Format '<3hH3h2iB' ile
+#   v[1..3] roll/pitch/yaw (x100) okunuyordu; firmware oraya qx,qy,qz (x10000)
+#   basıyor. Boyut tesadüfen eşit (23B) olduğu için CRC tutuyor ve paket GEÇERLİ
+#   görünüyordu, ama qx=0.35 ekranda roll=35.00° yazıyor, işaretli qz unsigned
+#   okunduğu için yaw 600°+ saçma değer alıyordu. Format '<7h2iB' yapıldı.
+# - Görev yükü paketi 24B -> 32B: hava yoğunluğu (uint16 x1000, nemli hava —
+#   Tetens + kısmi basınçlar, firmware'de hesaplanır) + yönelim quaternion
+#   (qx,qy,qz x10000) eklendi. Format '<HhHhH2i7h'.
+# - 3B sekmesi iki bağımsız yönelim paneline ayrıldı (roket | görev yükü):
+#   quaternion ile sürülen 3B model + yapay ufuk/yaw pusulası + dönüş hızı barları.
 # ==============================================================================
-# YER İSTASYONU v3.1 — FRAMED BINARY TELEMETRİ PROTOKOLü
+# YER İSTASYONU v3.2 — FRAMED BINARY TELEMETRİ PROTOKOLü (FIXED-POINT WIRE)
 # Roket : ESP32 UcusYazilimi/src/main.cpp → E32-433T30D LoRa @9600, ~10 Hz
-#         [0xAA][0x55][LEN=59][TelemetryPacket 59B][CRC16_HI][CRC16_LO] = 64B
+#         [0xAA][0x55][LEN=23][TelemetryWire 23B][CRC16_HI][CRC16_LO] = 28B
+#         TelemetryWire = ivmeToplam + quaternion(qx,qy,qz) + irtifa + dikeyHiz
+#                       + eğim + GPS(enlem,boylam) + durum bitfield.  '<7h2iB'
 # G.Yükü: ESP32 GorevYukuYazilimi/gorevyuku.cpp → E32-433T30D LoRa @9600, ~10 Hz
-#         [0xAA][0x55][LEN=48][GorevYukuPaket 48B][CRC16_HI][CRC16_LO] = 53B
-#         GorevYukuPaket = BME280(basinc,sicaklik,nem,irtifa) + GPS(enlem,boylam)
-#                        + BNO055 ivme(X,Y,Z) + BNO055 gyro(X,Y,Z) = 12 float.
-#                        roll/pitch/yaw ve uçuş durumu GÖNDERİLMEZ (bkz. gorevyuku.cpp).
+#         [0xAA][0x55][LEN=32][GorevYukuWire 32B][CRC16_HI][CRC16_LO] = 37B
+#         GorevYukuWire = BME280(basinc,sicaklik,nem,irtifa) + hava yoğunluğu
+#                       + GPS(enlem,boylam) + BNO055 bileşke ivme
+#                       + quaternion(qx,qy,qz) + gyro(X,Y,Z).  '<HhHhH2i7h'
+#                       Uçuş durumu GÖNDERİLMEZ (bkz. gorevyuku.cpp).
+# NOT: ham ivme eksenleri ve Tetens ara değerleri (es, pv) havadan GELMEZ;
+#      uçuş bilgisayarlarının SD kartında tam çözünürlükte kayıtlıdır.
 # ==============================================================================
 
 import sys
@@ -62,25 +78,34 @@ from collections import deque
 # Kaynak: UcusYazilimi/src/main.cpp (TelemetryWire) ve
 #         UcusYazilimi/GorevYukuYazilimi/gorevyuku.cpp (GorevYukuWire)
 # FIXED-POINT WIRE FORMAT (paket kucultme): firmware float -> packed int quantize.
-# Roket TelemetryWire (23B): ivmeToplam, roll, pitch (3x int16), yaw (uint16),
-#   irtifa, dikeyHiz, eglim (3x int16), gpsEnlem, gpsBoylam (2x int32),
-#   durum (uint8 bitfield). Olcekler asagidaki WIRE_OLCEK_* ile ters cevrilir.
+# Roket TelemetryWire (23B): ivmeToplam, qx, qy, qz (4x int16), irtifa, dikeyHiz,
+#   eglim (3x int16), gpsEnlem, gpsBoylam (2x int32), durum (uint8 bitfield).
+#   Olcekler asagidaki WIRE_OLCEK_* ile ters cevrilir.
 # NOT: ivmeX/Y/Z tek tek havadan GONDERILMEZ; yerine bileske (toplam) ivme
 #      buyuklugu sqrt(x^2+y^2+z^2) tek int16 slot ile gelir (byte duzeni AYNI).
 #      Ham 3 eksen + gyro roketin SD kartinda tam float kayitli.
-ROCKET_PACKET_FORMAT = '<3hH3h2iB'
+# DUZELTME (2026-07-29): format '<3hH3h2iB' idi ve v[1..3] roll/pitch/yaw (x100)
+#   olarak cozuluyordu. Firmware o slotlara quaternion (qx,qy,qz x10000) basiyor;
+#   boyut tesadufen esit oldugundan CRC tutuyor ve paket GECERLI gorunuyordu, ama
+#   qx=0.35 ekranda roll=35.00° yaziyordu ve isaretli qz unsigned okundugu icin
+#   yaw 600°+ sacma degerler aliyordu. Artik quaternion cozulur, roll/pitch/yaw
+#   ondan turetilir (asagidaki quat_* yardimcilari).
+ROCKET_PACKET_FORMAT = '<7h2iB'
 ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 23 byte
 ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 28 byte
 
-# GorevYukuWire (24B): basinc (uint16 hPa x10), sicaklik (int16 x100),
-#   nem (uint16 x100), irtifa (int16 x10), gpsEnlem/gpsBoylam (2x int32 x1e7),
-#   ivmeToplam (int16 x100), gyroX/Y/Z (3x int16 x10).
+# GorevYukuWire (32B): basinc (uint16 hPa x10), sicaklik (int16 x100),
+#   nem (uint16 x100), irtifa (int16 x10), yogunluk (uint16 kg/m^3 x1000),
+#   gpsEnlem/gpsBoylam (2x int32 x1e7), ivmeToplam (int16 x100),
+#   qx/qy/qz (3x int16 x10000), gyroX/Y/Z (3x int16 x10).
 # NOT: ivmeX/Y/Z tek tek GONDERILMEZ; yerine bileske (toplam) ivme buyuklugu
-#      sqrt(x^2+y^2+z^2) tek int16 slot ile gelir (28B->24B). Ham 3 eksen SD'de.
-#      BNO055'ten yalniz (toplam) ivme + gyro gonderilir; roll/pitch/yaw GONDERILMEZ.
-PAYLOAD_PACKET_FORMAT = '<HhHh2i4h'
-PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 24 byte
-PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 29 byte
+#      sqrt(x^2+y^2+z^2) tek int16 slot ile gelir. Ham 3 eksen SD'de.
+# NOT: yogunluk gorev yukunde BME280 basinc/sicaklik/nem uclusunden nemli hava
+#      formuluyle (Tetens + kismi basinclar) hesaplanir. Tetens ara degerleri
+#      (es, pv) havadan GELMEZ; gorev yukunun SD kartinda tam cozunurluktedir.
+PAYLOAD_PACKET_FORMAT = '<HhHhH2i7h'
+PAYLOAD_PACKET_SIZE = struct.calcsize(PAYLOAD_PACKET_FORMAT) # 32 byte
+PAYLOAD_FRAME_SIZE = 2 + 1 + PAYLOAD_PACKET_SIZE + 2 # 37 byte
 
 # --- FIXED-POINT OLCEKLER (firmware ile birebir; ters cevirmek icin bolunur) ---
 WIRE_OLCEK_IVME   = 100.0
@@ -92,6 +117,54 @@ WIRE_OLCEK_GPS    = 1e7
 WIRE_OLCEK_BASINC = 10.0    # hPa x10
 WIRE_OLCEK_SICAK  = 100.0
 WIRE_OLCEK_NEM    = 100.0
+WIRE_OLCEK_YOGUN  = 1000.0  # kg/m^3 x1000
+WIRE_OLCEK_QUAT   = 10000.0 # quaternion bileseni [-1,1] x10000 (w>=0)
+
+# --- QUATERNION YARDIMCILARI ---
+# Firmware w>=0 garanti eder (w<0 ise ucunun de isaretini cevirir), bu yuzden
+# w birim kuaterniyon kosulundan tek anlamli geri hesaplanir.
+def quat_w(x, y, z):
+    kare = 1.0 - (x*x + y*y + z*z)
+    return math.sqrt(kare) if kare > 0.0 else 0.0   # quantize hatasi negatife dusurebilir
+
+def _euler_to_quat(roll_deg, pitch_deg, yaw_deg):
+    """(roll, pitch, yaw) derece -> (qx, qy, qz), w>=0 normalize.
+    Yalniz SIMULATOR icin: firmware'in yolladigi gosterimi taklit eder ki
+    simulasyon da gercek ucusla ayni parse/3B yolundan gecsin."""
+    cr, sr = math.cos(math.radians(roll_deg)*0.5),  math.sin(math.radians(roll_deg)*0.5)
+    cp, sp = math.cos(math.radians(pitch_deg)*0.5), math.sin(math.radians(pitch_deg)*0.5)
+    cy, sy = math.cos(math.radians(yaw_deg)*0.5),   math.sin(math.radians(yaw_deg)*0.5)
+    w = cr*cp*cy + sr*sp*sy
+    x = sr*cp*cy - cr*sp*sy
+    y = cr*sp*cy + sr*cp*sy
+    z = cr*cp*sy - sr*sp*cy
+    sgn = -1.0 if w < 0.0 else 1.0    # firmware ile ayni: w>=0 garantisi
+    return sgn*x, sgn*y, sgn*z
+
+def _hava_yogunlugu(p_hpa, t_c, rh_pct):
+    """Nemli hava yogunlugu (kg/m^3) — gorevyuku.cpp ile BIREBIR ayni formul.
+    Yalniz SIMULATOR icin; gercek ucusta deger firmware'den hazir gelir."""
+    payda = t_c + 237.3
+    es = 0.0 if abs(payda) < 1e-3 else 6.1078 * (10.0 ** ((7.5 * t_c) / payda))
+    rh = max(0.0, min(100.0, rh_pct))
+    pv = min((rh / 100.0) * es, p_hpa)
+    pd = p_hpa - pv
+    tk = max(1.0, t_c + 273.15)
+    return (pd * 100.0) / (287.058 * tk) + (pv * 100.0) / (461.495 * tk)
+
+def quat_to_euler(x, y, z):
+    """Quaternion -> (roll, pitch, yaw) derece. Yalniz gosterge/CSV icin;
+    3B illustrasyon Euler'e HIC ugramaz (gimbal lock'tan kacinmak icin)."""
+    w = quat_w(x, y, z)
+    # roll (x ekseni etrafinda)
+    roll = math.degrees(math.atan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y)))
+    # pitch (y ekseni) — asin argumani quantize yuzunden [-1,1] disina tasabilir
+    sinp = 2.0*(w*y - z*x)
+    sinp = max(-1.0, min(1.0, sinp))
+    pitch = math.degrees(math.asin(sinp))
+    # yaw (z ekseni)
+    yaw = math.degrees(math.atan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z)))
+    return roll, pitch, yaw
 
 # Firmware q16/qu16/q32 ile birebir clamp (simulasyon paketleme overflow'unu onler).
 def _qi16(x): return max(-32768, min(32767, int(round(x))))
@@ -110,7 +183,8 @@ ROCKET_CSV_ALANLARI = [
     ('zaman_s', None, 3), ('saat', None, None),
     ('irtifa_m', 'irtifa', 2), ('dikeyHiz_ms', 'dikeyHiz', 2), ('eglim_derece', 'eglimAcisi', 2),
     ('ivmeToplam', 'ivmeToplam', 3),   # bileske ivme; ham eksenler+gyro havadan gelmiyor (SD'de tam kayitli)
-    ('roll', 'roll', 2), ('pitch', 'pitch', 2), ('yaw', 'yaw', 2),
+    ('qx', 'qx', 4), ('qy', 'qy', 4), ('qz', 'qz', 4),   # havadan gelen yonelim (ham)
+    ('roll', 'roll', 2), ('pitch', 'pitch', 2), ('yaw', 'yaw', 2),   # quaternion'dan turetildi
     ('gpsEnlem', 'gpsEnlem', 7), ('gpsBoylam', 'gpsBoylam', 7),
     ('ayrilma1', 'ayrilma1_durum', None), ('ayrilma2', 'ayrilma2_durum', None),
     ('ucus_durumu', 'ucus_durumu', None),
@@ -118,8 +192,11 @@ ROCKET_CSV_ALANLARI = [
 PAYLOAD_CSV_ALANLARI = [
     ('zaman_s', None, 3), ('saat', None, None),
     ('basinc_hPa', 'basinc', 2), ('sicaklik_C', 'bmeSicaklik', 2), ('nem_pct', 'nem', 2),
-    ('irtifa_m', 'irtifa', 2), ('gpsEnlem', 'gpsEnlem', 7), ('gpsBoylam', 'gpsBoylam', 7),
+    ('irtifa_m', 'irtifa', 2), ('yogunluk_kgm3', 'yogunluk', 4),
+    ('gpsEnlem', 'gpsEnlem', 7), ('gpsBoylam', 'gpsBoylam', 7),
     ('ivmeToplam', 'ivmeToplam', 3),   # bileske ivme; ham eksenler havadan gelmiyor (SD'de tam kayitli)
+    ('qx', 'qx', 4), ('qy', 'qy', 4), ('qz', 'qz', 4),   # havadan gelen yonelim (ham)
+    ('roll', 'roll', 2), ('pitch', 'pitch', 2), ('yaw', 'yaw', 2),   # quaternion'dan turetildi
     ('gyroX', 'gyroX', 3), ('gyroY', 'gyroY', 3), ('gyroZ', 'gyroZ', 3),
 ]
 
@@ -148,10 +225,13 @@ def parse_rocket_frame(raw: bytes):
     crc_recv = (raw[3 + ROCKET_PACKET_SIZE] << 8) | raw[3 + ROCKET_PACKET_SIZE + 1]
     if crc16_ccitt(payload) != crc_recv: return None
     v = struct.unpack(ROCKET_PACKET_FORMAT, payload)
-    durum = v[9]   # '<3hH3h2iB' -> 10 deger: v[9] = durum bitfield byte
+    durum = v[9]   # '<7h2iB' -> 10 deger: v[9] = durum bitfield byte
+    qx, qy, qz = v[1] / WIRE_OLCEK_QUAT, v[2] / WIRE_OLCEK_QUAT, v[3] / WIRE_OLCEK_QUAT
+    roll, pitch, yaw = quat_to_euler(qx, qy, qz)
     return {
         'ivmeToplam': v[0] / WIRE_OLCEK_IVME,   # bileske ivme sqrt(x^2+y^2+z^2) (ham eksenler havadan gelmiyor)
-        'roll':  v[1] / WIRE_OLCEK_ACI,  'pitch': v[2] / WIRE_OLCEK_ACI,  'yaw': v[3] / WIRE_OLCEK_ACI,
+        'qx': qx, 'qy': qy, 'qz': qz, 'qw': quat_w(qx, qy, qz),
+        'roll': roll, 'pitch': pitch, 'yaw': yaw,   # quaternion'dan turetildi (gosterge/CSV icin)
         'irtifa':     v[4] / WIRE_OLCEK_IRTIFA,
         'dikeyHiz':   v[5] / WIRE_OLCEK_HIZ,
         'eglimAcisi': v[6] / WIRE_OLCEK_ACI,
@@ -169,16 +249,24 @@ def parse_payload_frame(raw: bytes):
     payload = raw[3:3 + PAYLOAD_PACKET_SIZE]
     crc_recv = (raw[3 + PAYLOAD_PACKET_SIZE] << 8) | raw[3 + PAYLOAD_PACKET_SIZE + 1]
     if crc16_ccitt(payload) != crc_recv: return None
+    # '<HhHhH2i7h' -> 14 deger:
+    #   0 basinc, 1 sicaklik, 2 nem, 3 irtifa, 4 yogunluk, 5 enlem, 6 boylam,
+    #   7 ivmeToplam, 8-10 qx/qy/qz, 11-13 gyroX/Y/Z
     v = struct.unpack(PAYLOAD_PACKET_FORMAT, payload)
+    qx, qy, qz = v[8] / WIRE_OLCEK_QUAT, v[9] / WIRE_OLCEK_QUAT, v[10] / WIRE_OLCEK_QUAT
+    roll, pitch, yaw = quat_to_euler(qx, qy, qz)
     return {
         'basinc':      v[0] / WIRE_OLCEK_BASINC,   # hPa
         'bmeSicaklik': v[1] / WIRE_OLCEK_SICAK,
         'nem':         v[2] / WIRE_OLCEK_NEM,
         'irtifa':      v[3] / WIRE_OLCEK_IRTIFA,
-        'gpsEnlem':    v[4] / WIRE_OLCEK_GPS,
-        'gpsBoylam':   v[5] / WIRE_OLCEK_GPS,
-        'ivmeToplam': v[6] / WIRE_OLCEK_IVME,   # bileske ivme (ham eksenler havadan gelmiyor)
-        'gyroX': v[7] / WIRE_OLCEK_GYRO, 'gyroY': v[8] / WIRE_OLCEK_GYRO, 'gyroZ': v[9] / WIRE_OLCEK_GYRO,
+        'yogunluk':    v[4] / WIRE_OLCEK_YOGUN,    # nemli hava yogunlugu kg/m^3
+        'gpsEnlem':    v[5] / WIRE_OLCEK_GPS,
+        'gpsBoylam':   v[6] / WIRE_OLCEK_GPS,
+        'ivmeToplam':  v[7] / WIRE_OLCEK_IVME,     # bileske ivme (ham eksenler havadan gelmiyor)
+        'qx': qx, 'qy': qy, 'qz': qz, 'qw': quat_w(qx, qy, qz),
+        'roll': roll, 'pitch': pitch, 'yaw': yaw,   # quaternion'dan turetildi
+        'gyroX': v[11] / WIRE_OLCEK_GYRO, 'gyroY': v[12] / WIRE_OLCEK_GYRO, 'gyroZ': v[13] / WIRE_OLCEK_GYRO,
     }
 
 # (String modu tamamen kaldırıldı)
@@ -225,8 +313,11 @@ MAP_HTML = """
 <body>
     <div id="map"></div>
     <script>
-        var map = L.map('map').setView([38.835, 33.393], 5);
-        
+        // Yer istasyonu sabit konumu (acilista harita buraya odaklanir)
+        var GS_LAT = 41.634034, GS_LON = 26.624274;
+
+        var map = L.map('map').setView([GS_LAT, GS_LON], 16);
+
         // 1. Harita Katmanları (Base Layers)
         var darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
             maxZoom: 19, attribution: '© OpenStreetMap © CartoDB'
@@ -262,6 +353,12 @@ MAP_HTML = """
             shadowUrl: 'assets/marker-shadow.png',
             iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
         });
+
+        // Yer istasyonu isaretcisi (sabit)
+        L.circleMarker([GS_LAT, GS_LON], {
+            radius: 7, color: '#00E676', weight: 2,
+            fillColor: '#00E676', fillOpacity: 0.75
+        }).addTo(map).bindPopup('<b>📡 Yer İstasyonu</b><br>' + GS_LAT.toFixed(6) + ', ' + GS_LON.toFixed(6));
 
         var rocketMarker = null; var payloadMarker = null;
         var rFirst = true; var pFirst = true;
@@ -388,6 +485,16 @@ class SerialWorker(QThread):
         ayrilma2 = 0
         dt = 0.1
 
+        # --- GOREV YUKU BAGIMSIZ KONUMU (3B parametrik yorunge icin) ---
+        # Ayrilmadan sonra gorev yuku kendi parasutuyle ruzgarla suruklenir; roketin
+        # GPS izini birebir takip etmez. Simulatorde de ayri konum entegre edilir ki
+        # 3B yorunge ekrani gercekci (yatay suruklenmeli) bir egri gostersin.
+        gy_lat, gy_lon = lat, lon
+        # Ruzgar: irtifayla artan dogu-kuzeydogu esisi (derece/sn cinsinden taban hiz)
+        ruzgar_dogu   = 0.0000075
+        ruzgar_kuzey  = 0.0000042
+        gy_faz = random.uniform(0.0, math.tau)   # helisel salinim fazi
+
         while self.is_running:
             t = time.time() - self.start_time
             
@@ -433,20 +540,44 @@ class SerialWorker(QThread):
                 acc = 0.0
 
             # Fıldır Fıldır Dönme
-            r = (r + random.uniform(30.0, 90.0)) % 360 
-            p = (p + random.uniform(15.0, 45.0)) % 360 
+            r = (r + random.uniform(30.0, 90.0)) % 360
+            p = (p + random.uniform(15.0, 45.0)) % 360
             yaw_a = (yaw_a + random.uniform(20.0, 60.0)) % 360
-            
+
             # Gürültüsüz (noise-free) irtifa ve ivmeler
             sent_alt = alt
+
+            # --- GOREV YUKU KONUM ENTEGRASYONU (yalniz payload simulatorunde) ---
+            # Roket yukselirken ikisi birlikte gider (ayni govde); apoje/ayrilmadan
+            # sonra gorev yuku parasutle bagimsiz suruklenir. 3B parametrik yorunge
+            # ekrani boylece yatay suruklenmeli gercek bir egri gosterir.
+            if self.identifier != "rocket":
+                if ucus_durumu <= 1:
+                    # Ayrilma oncesi: roketle ayni konum (tek govde)
+                    gy_lat, gy_lon = lat, lon
+                else:
+                    # Ruzgar suruklenmesi: yuksekte daha guclu (basit kayma modeli)
+                    kat = 0.35 + 0.65 * min(1.0, max(0.0, alt) / 3800.0)
+                    gy_lat += ruzgar_kuzey * kat
+                    gy_lon += ruzgar_dogu * kat
+                    # Parasut altinda salinim (helisel iniz) -> egri duz cizgi olmaz
+                    gy_faz += 0.22
+                    gy_lat += 0.0000012 * math.cos(gy_faz)
+                    gy_lon += 0.0000012 * math.sin(gy_faz)
+
+            # Firmware ile ayni yonelim gosterimi: Euler -> quaternion (w>=0 normalize).
+            # Simulator da havadan quaternion yolladigi icin parse/3B yolu gercek
+            # ucusla birebir ayni kodu kullanir.
+            sqx, sqy, sqz = _euler_to_quat(r, p, yaw_a)
 
             if self.identifier == "rocket":
                 # Firmware quantize esdegeri: float -> packed int (paket kucultme, clamp'li)
                 # ivmeX/Y/Z tek tek gitmiyor -> yalniz bileske (toplam) ivme.
                 payload = struct.pack(ROCKET_PACKET_FORMAT,
                     _qi16(acc * WIRE_OLCEK_IVME),                           # ivmeToplam x100
-                    _qi16(r * WIRE_OLCEK_ACI), _qi16(p * WIRE_OLCEK_ACI),   # roll,pitch x100
-                    _qu16((yaw_a % 360) * WIRE_OLCEK_ACI),                  # yaw x100 (uint16)
+                    _qi16(sqx * WIRE_OLCEK_QUAT),                           # qx x10000
+                    _qi16(sqy * WIRE_OLCEK_QUAT),                           # qy x10000
+                    _qi16(sqz * WIRE_OLCEK_QUAT),                           # qz x10000
                     _qi16(sent_alt * WIRE_OLCEK_IRTIFA),                    # irtifa x10
                     _qi16(vel * WIRE_OLCEK_HIZ),                            # dikeyHiz x10
                     _qi16((p % 90) * WIRE_OLCEK_ACI),                       # eglim x100
@@ -460,19 +591,30 @@ class SerialWorker(QThread):
                     self.raw_data_signal.emit(self.identifier, frame.hex())
                     self.parsed_data_signal.emit(self.identifier, packet, t)
             else:
-                # GorevYukuWire (24B): BME280(basinc,sicaklik,nem,irtifa) + GPS
-                #  + BNO055 bileske ivme + gyro(X,Y,Z). roll/pitch/yaw göndermez.
+                # GorevYukuWire (32B): BME280(basinc,sicaklik,nem,irtifa) + yogunluk
+                #  + GPS + BNO055 bileske ivme + quaternion(qx,qy,qz) + gyro(X,Y,Z).
                 gy_ivmeToplam = abs(acc)   # bileske ivme buyuklugu (>=0)
                 basinc_hpa = 1013.25 - sent_alt * 0.12
                 sicaklik_c = 25.0 - sent_alt * 0.006
+                nem_pct    = 45.0
+                # Firmware ile ayni nemli hava formulu (Tetens + kismi basinclar)
+                yogunluk = _hava_yogunlugu(basinc_hpa, sicaklik_c, nem_pct)
+                # Donus hizi (rad/s): Euler artislarindan kabaca (10 Hz simulasyon)
                 payload = struct.pack(PAYLOAD_PACKET_FORMAT,
                     _qu16(basinc_hpa * WIRE_OLCEK_BASINC),                  # basinc hPa x10 (uint16)
                     _qi16(sicaklik_c * WIRE_OLCEK_SICAK),                   # sicaklik x100
-                    _qu16(45.0 * WIRE_OLCEK_NEM),                          # nem x100 (uint16)
+                    _qu16(nem_pct * WIRE_OLCEK_NEM),                        # nem x100 (uint16)
                     _qi16(sent_alt * WIRE_OLCEK_IRTIFA),                    # irtifa x10
-                    _qi32(lat * WIRE_OLCEK_GPS), _qi32(lon * WIRE_OLCEK_GPS),  # gps x1e7
+                    _qu16(yogunluk * WIRE_OLCEK_YOGUN),                     # yogunluk x1000 (uint16)
+                    # Gorev yukunun KENDI konumu (ayrilma sonrasi roketten sapar)
+                    _qi32(gy_lat * WIRE_OLCEK_GPS), _qi32(gy_lon * WIRE_OLCEK_GPS),  # gps x1e7
                     _qi16(gy_ivmeToplam * WIRE_OLCEK_IVME),                 # ivmeToplam x100
-                    0, 0, 0                                                  # gyro x10
+                    _qi16(sqx * WIRE_OLCEK_QUAT),                           # qx x10000
+                    _qi16(sqy * WIRE_OLCEK_QUAT),                           # qy x10000
+                    _qi16(sqz * WIRE_OLCEK_QUAT),                           # qz x10000
+                    _qi16(math.radians(60.0) * WIRE_OLCEK_GYRO),            # gyroX x10
+                    _qi16(math.radians(30.0) * WIRE_OLCEK_GYRO),            # gyroY x10
+                    _qi16(math.radians(45.0) * WIRE_OLCEK_GYRO),            # gyroZ x10
                 )
                 crc = crc16_ccitt(payload)
                 frame = bytes([SYNC_1, SYNC_2, PAYLOAD_PACKET_SIZE]) + payload + bytes([(crc>>8)&0xFF, crc&0xFF])
@@ -503,20 +645,41 @@ class SerialWorker(QThread):
 
 # ----------------- 3D OPENGL WIDGET -----------------
 class Rocket3DWidget(QOpenGLWidget):
+    """Gercek zamanli 3B yonelim. Quaternion ile surulur — Euler'e HIC ugranmaz,
+    boylece dik ucusta gimbal lock yasanmaz (roll/pitch/yaw yalniz gosterge icin
+    ayrica turetilir). set_quat(x, y, z) cagrilir; w firmware garantisi (w>=0)
+    sayesinde birim kuaterniyon kosulundan geri hesaplanir."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.roll = 0.0
-        self.pitch = 0.0
-        self.yaw = 0.0
-        
+        self.qx = self.qy = self.qz = 0.0
+        self.qw = 1.0
+        self._mat = self._birim_matris()
+
         self.cam_rot_x = 30.0
         self.cam_rot_y = -45.0
         self.last_mouse_pos = None
 
-    def set_angles(self, r, p, y):
-        self.roll = r
-        self.pitch = p
-        self.yaw = y
+    @staticmethod
+    def _birim_matris():
+        return [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+
+    def set_quat(self, x, y, z):
+        self.qx, self.qy, self.qz = x, y, z
+        self.qw = w = quat_w(x, y, z)
+        # Quaternion -> 4x4 rotasyon matrisi (OpenGL SUTUN-oncelikli bekler)
+        xx, yy, zz = x*x, y*y, z*z
+        xy, xz, yz = x*y, x*z, y*z
+        wx, wy, wz = w*x, w*y, w*z
+        self._mat = [
+            1.0 - 2.0*(yy + zz),  2.0*(xy + wz),        2.0*(xz - wy),        0.0,
+            2.0*(xy - wz),        1.0 - 2.0*(xx + zz),  2.0*(yz + wx),        0.0,
+            2.0*(xz + wy),        2.0*(yz - wx),        1.0 - 2.0*(xx + yy),  0.0,
+            0.0,                  0.0,                  0.0,                  1.0,
+        ]
         self.update()
 
     def mousePressEvent(self, event):
@@ -566,9 +729,7 @@ class Rocket3DWidget(QOpenGLWidget):
         glRotatef(self.cam_rot_x, 1.0, 0.0, 0.0)
         glRotatef(self.cam_rot_y, 0.0, 1.0, 0.0)
         
-        glRotatef(self.yaw, 0.0, 1.0, 0.0)
-        glRotatef(self.pitch, 1.0, 0.0, 0.0)
-        glRotatef(self.roll, 0.0, 0.0, 1.0)
+        glMultMatrixf(self._mat)   # quaternion rotasyonu (gimbal lock yok)
 
         glLineWidth(3.0)
         glBegin(GL_LINES)
@@ -583,9 +744,7 @@ class Rocket3DWidget(QOpenGLWidget):
         glRotatef(self.cam_rot_x, 1.0, 0.0, 0.0)
         glRotatef(self.cam_rot_y, 0.0, 1.0, 0.0)
 
-        glRotatef(self.yaw, 0.0, 1.0, 0.0)    
-        glRotatef(self.pitch, 1.0, 0.0, 0.0)  
-        glRotatef(self.roll, 0.0, 0.0, 1.0)   
+        glMultMatrixf(self._mat)   # quaternion rotasyonu (gimbal lock yok)
 
         glTranslatef(0.0, 0.0, -1.0)
         
@@ -615,8 +774,8 @@ class Rocket3DWidget(QOpenGLWidget):
         gluCylinder(quadric, 0.3, 0.2, -0.4, 32, 2)
         glPopMatrix()
 
-        glDisable(GL_LIGHTING) 
-        glColor3f(0.8, 0.1, 0.1) 
+        glDisable(GL_LIGHTING)
+        glColor3f(0.8, 0.1, 0.1)
         glBegin(GL_TRIANGLES)
         for i in range(4):
             angle = math.radians(i * 90.0)
@@ -629,6 +788,443 @@ class Rocket3DWidget(QOpenGLWidget):
         glEnable(GL_LIGHTING)
         gluDeleteQuadric(quadric)
         glDisable(GL_LIGHTING)
+
+
+# ----------------- YAPAY UFUK (ATTITUDE INDICATOR) -----------------
+class YapayUfuk(QWidget):
+    """Ucak tipi yapay ufuk: govde roll kadar doner, ufuk cizgisi pitch kadar
+    kayar. Altinda yaw pusula seridi. 3B modelin yaninda 'tek bakista oku'
+    gostergesi olarak durur."""
+
+    PITCH_PIKSEL_DERECE = 2.2   # 1 derece pitch = kac piksel kayma
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.roll = self.pitch = self.yaw = 0.0
+        self.setMinimumHeight(150)
+
+    def set_attitude(self, roll, pitch, yaw):
+        self.roll, self.pitch, self.yaw = roll, pitch, yaw
+        self.update()
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPolygon
+        from PyQt6.QtCore import QRect, QPoint
+
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        pusula_h = 22
+        ufuk_h = max(10, h - pusula_h - 2)
+        cx, cy = w / 2.0, ufuk_h / 2.0
+        yaricap = max(10.0, min(cx, cy) - 4.0)
+
+        qp.setClipRect(0, 0, w, ufuk_h)
+
+        # --- Donen gok/yer diski ---
+        qp.save()
+        qp.translate(cx, cy)
+        qp.rotate(-self.roll)
+        kayma = self.pitch * self.PITCH_PIKSEL_DERECE
+        qp.translate(0, kayma)
+
+        buyuk = yaricap * 3.0   # dondurunce kose bosluğu kalmasin diye tasirtiyoruz
+        qp.setPen(Qt.PenStyle.NoPen)
+        qp.setBrush(QBrush(QColor(60, 130, 200)))                       # gok
+        qp.drawRect(QRect(int(-buyuk), int(-buyuk), int(2*buyuk), int(buyuk)))
+        qp.setBrush(QBrush(QColor(120, 85, 45)))                        # yer
+        qp.drawRect(QRect(int(-buyuk), 0, int(2*buyuk), int(buyuk)))
+
+        # Ufuk cizgisi
+        qp.setPen(QPen(QColor(255, 255, 255), 2))
+        qp.drawLine(int(-buyuk), 0, int(buyuk), 0)
+
+        # Pitch merdiveni (10 derecede bir)
+        qp.setPen(QPen(QColor(235, 235, 235), 1))
+        for derece in range(-90, 91, 10):
+            if derece == 0:
+                continue
+            y = -derece * self.PITCH_PIKSEL_DERECE
+            if abs(y) > buyuk:
+                continue
+            yari = yaricap * (0.42 if derece % 30 == 0 else 0.22)
+            qp.drawLine(int(-yari), int(y), int(yari), int(y))
+            if derece % 30 == 0:
+                qp.drawText(int(yari + 4), int(y + 4), f"{derece}")
+        qp.restore()
+
+        # --- Sabit ucak sembolu (govde referansi) ---
+        qp.setPen(QPen(QColor(255, 200, 0), 3))
+        qp.drawLine(int(cx - yaricap*0.5), int(cy), int(cx - yaricap*0.15), int(cy))
+        qp.drawLine(int(cx + yaricap*0.15), int(cy), int(cx + yaricap*0.5), int(cy))
+        qp.drawPoint(int(cx), int(cy))
+
+        # --- Roll gostergesi (ust yay + ucgen imlec) ---
+        qp.setPen(QPen(QColor(230, 230, 230), 1))
+        for derece in (-60, -30, -10, 0, 10, 30, 60):
+            a = math.radians(90 + derece)
+            x1 = cx + yaricap * 0.92 * math.cos(a)
+            y1 = cy - yaricap * 0.92 * math.sin(a)
+            x2 = cx + yaricap * 1.0 * math.cos(a)
+            y2 = cy - yaricap * 1.0 * math.sin(a)
+            qp.drawLine(int(x1), int(y1), int(x2), int(y2))
+        a = math.radians(90 + self.roll)
+        ux, uy = cx + yaricap*0.86*math.cos(a), cy - yaricap*0.86*math.sin(a)
+        qp.setBrush(QBrush(QColor(255, 200, 0)))
+        qp.setPen(Qt.PenStyle.NoPen)
+        qp.drawPolygon(QPolygon([QPoint(int(ux), int(uy)),
+                                 QPoint(int(ux - 5), int(uy - 9)),
+                                 QPoint(int(ux + 5), int(uy - 9))]))
+
+        # --- Yaw pusula seridi ---
+        qp.setClipping(False)
+        py = ufuk_h + 1
+        qp.setPen(Qt.PenStyle.NoPen)
+        qp.setBrush(QBrush(QColor(30, 30, 34)))
+        qp.drawRect(0, py, w, pusula_h)
+        qp.setPen(QPen(QColor(200, 200, 200), 1))
+        yaw = self.yaw % 360.0
+        piksel_derece = w / 120.0     # gorunur pencere: +-60 derece
+        for derece in range(0, 360, 10):
+            fark = (derece - yaw + 180.0) % 360.0 - 180.0
+            x = w/2.0 + fark * piksel_derece
+            if x < 0 or x > w:
+                continue
+            if derece % 30 == 0:
+                qp.drawLine(int(x), py + 2, int(x), py + 9)
+                etiket = {0: 'K', 90: 'D', 180: 'G', 270: 'B'}.get(derece, str(derece))
+                qp.drawText(int(x) - 8, py + pusula_h - 2, etiket)
+            else:
+                qp.drawLine(int(x), py + 2, int(x), py + 6)
+        qp.setPen(QPen(QColor(255, 200, 0), 2))
+        qp.drawLine(int(w/2), py, int(w/2), py + pusula_h)
+        qp.end()
+
+
+# ----------------- DONUS HIZI BARLARI (GYRO) -----------------
+class DonusHiziBarlari(QWidget):
+    """Gyro X/Y/Z: quaternion yonelimi verir, gyro donus HIZINI verir.
+    Merkezden iki yana buyuyen barlar; isaret donus yonunu gosterir."""
+
+    TAM_OLCEK = 6.0   # rad/s — barin ucuna karsilik gelen deger (~344 °/s)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.gx = self.gy = self.gz = 0.0
+        self.setMinimumHeight(74)
+        self.setMaximumHeight(88)
+
+    def set_gyro(self, gx, gy, gz):
+        self.gx, self.gy, self.gz = gx, gy, gz
+        self.update()
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        satirlar = (("X", self.gx, QColor(230, 80, 80)),
+                    ("Y", self.gy, QColor(80, 200, 110)),
+                    ("Z", self.gz, QColor(90, 150, 240)))
+        sol_bosluk, sag_bosluk = 22, 62
+        bar_w = max(10, w - sol_bosluk - sag_bosluk)
+        cx = sol_bosluk + bar_w / 2.0
+        satir_h = h / 3.0
+
+        for i, (ad, deger, renk) in enumerate(satirlar):
+            y = i * satir_h + satir_h / 2.0
+            qp.setPen(QPen(QColor(160, 160, 160), 1))
+            qp.drawText(2, int(y + 4), ad)
+            # Iz
+            qp.setPen(Qt.PenStyle.NoPen)
+            qp.setBrush(QBrush(QColor(45, 45, 50)))
+            qp.drawRect(int(sol_bosluk), int(y - 6), int(bar_w), 12)
+            # Deger bari (merkezden)
+            oran = max(-1.0, min(1.0, deger / self.TAM_OLCEK))
+            uzunluk = oran * (bar_w / 2.0)
+            qp.setBrush(QBrush(renk))
+            if uzunluk >= 0:
+                qp.drawRect(int(cx), int(y - 6), int(uzunluk), 12)
+            else:
+                qp.drawRect(int(cx + uzunluk), int(y - 6), int(-uzunluk), 12)
+            # Merkez cizgisi
+            qp.setPen(QPen(QColor(200, 200, 200), 1))
+            qp.drawLine(int(cx), int(y - 8), int(cx), int(y + 8))
+            qp.drawText(int(sol_bosluk + bar_w + 5), int(y + 4), f"{deger:+.2f} rad/s")
+        qp.end()
+
+
+# ----------------- 3B PARAMETRIK YORUNGE (GOREV YUKU) -----------------
+class ParametrikYorunge3D(QOpenGLWidget):
+    """Gorev yukunun 3B parametrik ucus yorungesi: (x(t), y(t), z(t)).
+
+    Parametre t = paket zamani. GPS enlem/boylam ilk gecerli fix'e gore
+    METREYE cevrilir (yerel duzlem yaklasimi: enlem 1 derece ~ 111320 m,
+    boylam ayrica cos(enlem) ile daralir), irtifa dogrudan z olur. Boylece
+    eksenler ayni birimde (m) ve yorungenin sekli bozulmaz.
+
+    Ekranda: yer duzlemi izgarasi + zemine dusurulen golge iz + renk
+    gradyanli (eskimis mavi -> guncel turuncu) yorunge + guncel konum
+    isaretcisi ve dikey irtifa cizgisi. Fare ile dondur, tekerlek ile yakinlas."""
+
+    IZ_SINIRI = 6000            # cizilen maksimum nokta (10 Hz'de ~10 dk)
+    MIN_YARICAP = 5.0           # m — tum noktalar ustuste ise minimum olcek
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Yorunge noktalari: metre cinsinden (dogu, kuzey, irtifa) + zaman
+        self.pts = deque(maxlen=self.IZ_SINIRI)
+        self._ref = None         # (enlem0, boylam0, irtifa0) ilk gecerli fix
+        self._merkez = (0.0, 0.0, 0.0)
+        self._olcek = self.MIN_YARICAP
+
+        self.cam_rot_x = 24.0
+        self.cam_rot_y = -50.0
+        self.cam_zoom = 1.0
+        self.last_mouse_pos = None
+
+    # ---- veri ----
+    def ekle(self, enlem, boylam, irtifa, t):
+        """Yeni GPS+irtifa ornegi. Gecersiz (0,0) fix'ler atlanir."""
+        if enlem == 0.0 and boylam == 0.0:
+            return
+        if self._ref is None:
+            self._ref = (enlem, boylam, irtifa)
+        e0, b0, i0 = self._ref
+        kuzey = (enlem - e0) * 111320.0
+        dogu = (boylam - b0) * 111320.0 * math.cos(math.radians(e0))
+        self.pts.append((dogu, kuzey, irtifa - i0, t))
+        self._olcek_guncelle()
+        self.update()
+
+    def temizle(self):
+        self.pts.clear()
+        self._ref = None
+        self._merkez = (0.0, 0.0, 0.0)
+        self._olcek = self.MIN_YARICAP
+        self.update()
+
+    def _olcek_guncelle(self):
+        """Yorunge kutusunu bul; kamera onu tam dolduracak sekilde normalize et."""
+        if not self.pts:
+            return
+        xs = [p[0] for p in self.pts]
+        ys = [p[1] for p in self.pts]
+        zs = [p[2] for p in self.pts]
+        self._merkez = ((min(xs) + max(xs)) / 2.0,
+                        (min(ys) + max(ys)) / 2.0,
+                        (min(zs) + max(zs)) / 2.0)
+        yaricap = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) / 2.0
+        self._olcek = max(self.MIN_YARICAP, yaricap)
+
+    # ---- fare ----
+    def mousePressEvent(self, e):
+        self.last_mouse_pos = e.position()
+
+    def mouseMoveEvent(self, e):
+        if self.last_mouse_pos is None:
+            return
+        p = e.position()
+        self.cam_rot_y += (p.x() - self.last_mouse_pos.x()) * 0.5
+        self.cam_rot_x += (p.y() - self.last_mouse_pos.y()) * 0.5
+        self.cam_rot_x = max(-89.0, min(89.0, self.cam_rot_x))
+        self.last_mouse_pos = p
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        self.last_mouse_pos = None
+
+    def wheelEvent(self, e):
+        self.cam_zoom *= 1.0 + (e.angleDelta().y() / 120.0) * 0.1
+        self.cam_zoom = max(0.2, min(8.0, self.cam_zoom))
+        self.update()
+
+    # ---- OpenGL ----
+    def initializeGL(self):
+        glClearColor(0.10, 0.10, 0.12, 1.0)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    def resizeGL(self, w, h):
+        glViewport(0, 0, w, h)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        if h == 0:
+            h = 1
+        gluPerspective(45.0, w / float(h), 0.05, 400.0)
+        glMatrixMode(GL_MODELVIEW)
+
+    def paintGL(self):
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glDisable(GL_LIGHTING)
+        glLoadIdentity()
+        # Kutu en buyuk eksenine gore [-1,1]'e normalize edilir; kamera bu kureyi
+        # (kose kosegeni dahil) 45 derece FOV icine TAM sigdiracak mesafeye cekilir.
+        # Sabit mesafe kullanilsa yuksek irtifali ucuslarda egri ekrandan tasardi.
+        # r=sqrt(3) kutu kosegeni, /tan(22.5) FOV yarisi, 1.15 kenar boslugu payi.
+        uzaklik = (math.sqrt(3.0) / math.tan(math.radians(22.5))) * 1.15
+        glTranslatef(0.0, 0.0, -uzaklik / self.cam_zoom)
+        glRotatef(self.cam_rot_x, 1.0, 0.0, 0.0)
+        glRotatef(self.cam_rot_y, 0.0, 1.0, 0.0)
+
+        s = 1.0 / self._olcek
+        cx, cy, cz = self._merkez
+
+        def nrm(p):
+            """metre -> normalize sahne koordinati (OpenGL'de y yukari)."""
+            return ((p[0] - cx) * s, (p[2] - cz) * s, -(p[1] - cy) * s)
+
+        # --- yer izgarasi (z tabaninda) ---
+        taban = (min((p[2] for p in self.pts), default=0.0) - cz) * s
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        glColor4f(0.25, 0.25, 0.30, 1.0)
+        adim = 0.25
+        n = 6
+        for i in range(-n, n + 1):
+            u = i * adim
+            glVertex3f(-n * adim, taban, u); glVertex3f(n * adim, taban, u)
+            glVertex3f(u, taban, -n * adim); glVertex3f(u, taban, n * adim)
+        glEnd()
+
+        # --- eksen okları (K/D + yukari) ---
+        glLineWidth(2.0)
+        glBegin(GL_LINES)
+        glColor3f(0.85, 0.30, 0.30); glVertex3f(0.0, taban, 0.0); glVertex3f(0.5, taban, 0.0)    # dogu (+x)
+        glColor3f(0.30, 0.75, 0.35); glVertex3f(0.0, taban, 0.0); glVertex3f(0.0, taban, -0.5)   # kuzey (-z)
+        glColor3f(0.35, 0.55, 0.95); glVertex3f(0.0, taban, 0.0); glVertex3f(0.0, taban + 0.5, 0.0)  # yukari
+        glEnd()
+
+        if not self.pts:
+            return
+
+        noktalar = [nrm(p) for p in self.pts]
+        say = len(noktalar)
+
+        # --- zemine dusurulen golge iz (yer izdusumu) ---
+        glLineWidth(1.0)
+        glColor4f(0.55, 0.55, 0.60, 0.45)
+        glBegin(GL_LINE_STRIP)
+        for x, _y, z in noktalar:
+            glVertex3f(x, taban, z)
+        glEnd()
+
+        # --- parametrik yorunge: zaman gradyanli renk ---
+        glLineWidth(2.5)
+        glBegin(GL_LINE_STRIP)
+        for i, (x, y, z) in enumerate(noktalar):
+            f = i / max(1, say - 1)          # 0 = en eski, 1 = en guncel
+            glColor4f(0.15 + 0.85 * f, 0.45 + 0.15 * f, 0.95 - 0.75 * f, 0.35 + 0.65 * f)
+            glVertex3f(x, y, z)
+        glEnd()
+
+        # --- guncel konum: dikey irtifa cizgisi + isaretci ---
+        gx, gy, gz = noktalar[-1]
+        glLineWidth(1.0)
+        glColor4f(1.0, 0.60, 0.10, 0.55)
+        glBegin(GL_LINES)
+        glVertex3f(gx, taban, gz); glVertex3f(gx, gy, gz)
+        glEnd()
+
+        glPointSize(9.0)
+        glColor3f(1.0, 0.60, 0.10)
+        glBegin(GL_POINTS)
+        glVertex3f(gx, gy, gz)
+        glEnd()
+
+        # --- baslangic noktasi ---
+        bx, by, bz = noktalar[0]
+        glPointSize(7.0)
+        glColor3f(0.30, 0.85, 0.40)
+        glBegin(GL_POINTS)
+        glVertex3f(bx, by, bz)
+        glEnd()
+
+
+# ----------------- YONELIM PANELI (3B + YAPAY UFUK + GYRO) -----------------
+class YonelimPaneli(QWidget):
+    """Tek bir gövdenin (roket veya gorev yuku) gercek zamanli hareket
+    gostergeleri: ust blok + yapay ufuk/pusula + donus hizi barlari.
+    Hepsi ayni pakete ait quaternion ve gyro verisinden surulur.
+
+    ust_mod='illustrasyon' -> quaternion ile surulen 3B model (roket)
+    ust_mod='yorunge'      -> 3B parametrik ucus yorungesi (gorev yuku)"""
+
+    def __init__(self, baslik, renk="#4CAF50", ust_mod="illustrasyon", parent=None):
+        super().__init__(parent)
+        self.ust_mod = ust_mod
+        if ust_mod == "yorunge":
+            self.gl = None
+            self.yorunge = ParametrikYorunge3D()
+            ust_widget = self.yorunge
+        else:
+            self.gl = Rocket3DWidget()
+            self.yorunge = None
+            ust_widget = self.gl
+        self.ufuk = YapayUfuk()
+        self.gyro = DonusHiziBarlari()
+
+        self.bilgi = QLabel("R: -  P: -  Y: -")
+        self.bilgi.setStyleSheet("color: #BDBDBD; font-size: 12px;")
+        self.bilgi.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        baslik_lbl = QLabel(baslik)
+        baslik_lbl.setStyleSheet(f"color: {renk}; font-weight: bold; font-size: 14px;")
+        baslik_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        yerlesim = QVBoxLayout(self)
+        yerlesim.setContentsMargins(4, 4, 4, 4)
+        yerlesim.setSpacing(4)
+        yerlesim.addWidget(baslik_lbl)
+        if ust_mod == "yorunge":
+            # Yorunge basligi + eksen aciklamasi (renkler paintGL ile birebir)
+            yorunge_lbl = QLabel("3B Parametrik Yörünge  —  x: Doğu (m)  ·  "
+                                 "y: Kuzey (m)  ·  z: İrtifa (m)   |   "
+                                 "🟢 başlangıç → 🟠 anlık")
+            yorunge_lbl.setStyleSheet("color: #9E9E9E; font-size: 11px;")
+            yorunge_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            yerlesim.addWidget(yorunge_lbl)
+        yerlesim.addWidget(ust_widget, stretch=3)
+        if ust_mod == "yorunge":
+            self.yorunge_bilgi = QLabel("Δ Doğu: -   Δ Kuzey: -   Δ İrtifa: -   ·   yatay: -")
+            self.yorunge_bilgi.setStyleSheet("color: #BDBDBD; font-size: 12px;")
+            self.yorunge_bilgi.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            yerlesim.addWidget(self.yorunge_bilgi)
+        yerlesim.addWidget(self.bilgi)
+        yerlesim.addWidget(self.ufuk, stretch=2)
+        yerlesim.addWidget(self.gyro)
+
+    def guncelle(self, packet):
+        """Paket sozlugunden tum gostergeleri surer. Quaternion yoksa (eski
+        firmware) sessizce atlar — arayuz cokmez."""
+        if 'qx' not in packet:
+            return
+        if self.gl is not None:
+            self.gl.set_quat(packet['qx'], packet['qy'], packet['qz'])
+        self.ufuk.set_attitude(packet['roll'], packet['pitch'], packet['yaw'])
+        self.gyro.set_gyro(packet.get('gyroX', 0.0),
+                           packet.get('gyroY', 0.0),
+                           packet.get('gyroZ', 0.0))
+        self.bilgi.setText(
+            f"R: {packet['roll']:+.1f}°   P: {packet['pitch']:+.1f}°   Y: {packet['yaw']:+.1f}°")
+
+    def yorunge_ekle(self, packet, t):
+        """3B parametrik yorungeye yeni ornek ekler (yalniz yorunge modunda)."""
+        if self.yorunge is None:
+            return
+        self.yorunge.ekle(packet.get('gpsEnlem', 0.0), packet.get('gpsBoylam', 0.0),
+                          packet.get('irtifa', 0.0), t)
+        if self.yorunge.pts:
+            dx, dy, dz, _ = self.yorunge.pts[-1]
+            self.yorunge_bilgi.setText(
+                f"Δ Doğu: {dx:+.1f} m   Δ Kuzey: {dy:+.1f} m   Δ İrtifa: {dz:+.1f} m"
+                f"   ·   yatay: {math.hypot(dx, dy):.1f} m   ·   {len(self.yorunge.pts)} nokta")
+
+    def yorunge_temizle(self):
+        if self.yorunge is not None:
+            self.yorunge.temizle()
+            self.yorunge_bilgi.setText("Δ Doğu: -   Δ Kuzey: -   Δ İrtifa: -   ·   yatay: -")
 
 
 # ----------------- ANA SİSTEM -----------------
@@ -815,14 +1411,17 @@ class SerialViewerApp(QMainWindow):
 
         p_form_layout = QFormLayout()
         self._form_ayarla(p_form_layout)
-        # GorevYukuPaket: BME280 + GPS + BNO055 (ivme+gyro). Firmware roll/pitch/yaw
-        # ve uçuş durumu GÖNDERMEZ (gorevyuku.cpp), o alanlar arayüzde yok.
+        # GorevYukuPaket: BME280 + hava yogunlugu + GPS + BNO055 (ivme+quaternion+gyro).
+        # Firmware uçuş durumu GÖNDERMEZ (gorevyuku.cpp), o alan arayüzde yok.
+        # Yoğunluk görev yükünde nemli hava formülüyle hesaplanıp hazır gelir.
         self.payload_labels = {
             "İrtifa (m)":       QLabel("-"),
             "Sıcaklık (°C)":    QLabel("-"),
             "Basınç (hPa)":     QLabel("-"),
             "Nem (%)":          QLabel("-"),
+            "Hava Yoğunluğu (kg/m³)": QLabel("-"),
             "Toplam İvme (m/s²)": QLabel("-"),
+            "Yönelim (R,P,Y)":  QLabel("-"),
             "Gyro XYZ (rad/s)": QLabel("-"),
             "GPS":              QLabel("-"),
             "Paket (OK/Hata)":  QLabel("-"),
@@ -946,8 +1545,19 @@ class SerialViewerApp(QMainWindow):
         t3d_layout = QVBoxLayout(self.tab_3d)
         t3d_layout.setContentsMargins(0, 0, 0, 0) 
 
-        self.gl_widget = Rocket3DWidget()
-        t3d_layout.addWidget(self.gl_widget)
+        # Roket ve gorev yuku ayrilma sonrasi bagimsiz iki govde -> iki bagimsiz
+        # yonelim paneli (3B model + yapay ufuk/pusula + donus hizi barlari).
+        t3d_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Gorev yukunde 3B illustrasyon yerine 3B parametrik ucus yorungesi cizilir.
+        self.rocket_yonelim  = YonelimPaneli("🚀 ROKET (UKB)",     "#4CAF50")
+        self.payload_yonelim = YonelimPaneli("🛰️ GÖREV YÜKÜ (BGY)", "#FF9800",
+                                             ust_mod="yorunge")
+        t3d_splitter.addWidget(self.rocket_yonelim)
+        t3d_splitter.addWidget(self.payload_yonelim)
+        t3d_splitter.setSizes([500, 500])
+        t3d_layout.addWidget(t3d_splitter)
+        # Geriye donuk ad: kodun kalaninda gl_widget roketin 3B modelini gosterir
+        self.gl_widget = self.rocket_yonelim.gl
         self.tabs.addTab(self.tab_3d, "🎯 3D Aviyonik")
         
         # Sol veri kolonu doğrudan yatay splitter'a; sekmeler ise sağ dikey bloğun ÜST
@@ -1138,6 +1748,8 @@ class SerialViewerApp(QMainWindow):
         self.last_payload_packet_time = time.time()
         self.payload_timeout_active = False
         self.payload_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 15px; }")
+        # Yeni ucus/oturum: onceki yorunge izi uzerine binmesin (GPS referansi da sifirlanir)
+        self.payload_yonelim.yorunge_temizle()
 
         self.payload_worker.start()
 
@@ -1243,7 +1855,8 @@ class SerialViewerApp(QMainWindow):
                 self.rocket_labels["Aviyonik (R,P,Y)"].setText(
                     f"{packet['roll']:.1f}, {packet['pitch']:.1f}, {packet['yaw']:.1f}")
  
-                self.gl_widget.set_angles(packet['roll'], packet['pitch'], packet['yaw'])
+                # 3B model + yapay ufuk + donus barlari (quaternion'dan surulur)
+                self.rocket_yonelim.guncelle(packet)
                 now = time.monotonic()
                 if (packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0) and \
                         now - self._son_harita.get("rocket", 0.0) >= 0.5:
@@ -1280,12 +1893,23 @@ class SerialViewerApp(QMainWindow):
                 self.payload_labels["Nem (%)"].setText(f"{packet['nem']:.1f}")
                 self.p_hum.append(packet['nem']); self.p_t_hum.append(t)
 
-                # BNO055 — görev yükü artık bileske ivme + gyro gönderiyor (roll/pitch/yaw yok)
+                # Hava yoğunluğu — görev yükünde BME280 P/T/RH üçlüsünden nemli hava
+                # formülüyle (Tetens + kısmi basınçlar) hesaplanıp hazır gelir.
+                self.payload_labels["Hava Yoğunluğu (kg/m³)"].setText(f"{packet['yogunluk']:.4f}")
+
+                # BNO055 — görev yükü bileşke ivme + quaternion + gyro gönderiyor
                 self.payload_labels["Toplam İvme (m/s²)"].setText(f"{packet['ivmeToplam']:.2f}")
+                self.payload_labels["Yönelim (R,P,Y)"].setText(
+                    f"{packet['roll']:.1f}, {packet['pitch']:.1f}, {packet['yaw']:.1f}")
                 self.payload_labels["Gyro XYZ (rad/s)"].setText(
                     f"{packet['gyroX']:.2f}, {packet['gyroY']:.2f}, {packet['gyroZ']:.2f}")
 
                 self.payload_labels["GPS"].setText(f"{packet['gpsEnlem']:.5f}, {packet['gpsBoylam']:.5f}")
+
+                # Yapay ufuk + donus barlari (quaternion'dan surulur)
+                self.payload_yonelim.guncelle(packet)
+                # 3B parametrik yorunge: (dogu, kuzey, irtifa)(t) — GPS+irtifa'dan
+                self.payload_yonelim.yorunge_ekle(packet, t)
 
                 now = time.monotonic()
                 if (packet['gpsEnlem'] != 0.0 or packet['gpsBoylam'] != 0.0) and \

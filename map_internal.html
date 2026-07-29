@@ -14,8 +14,11 @@
 <body>
     <div id="map"></div>
     <script>
-        var map = L.map('map').setView([38.835, 33.393], 5);
-        
+        // Yer istasyonu sabit konumu (acilista harita buraya odaklanir)
+        var GS_LAT = 41.634034, GS_LON = 26.624274;
+
+        var map = L.map('map').setView([GS_LAT, GS_LON], 16);
+
         // 1. Harita Katmanları (Base Layers)
         var darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
             maxZoom: 19, attribution: '© OpenStreetMap © CartoDB'
@@ -51,6 +54,12 @@
             shadowUrl: 'assets/marker-shadow.png',
             iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
         });
+
+        // Yer istasyonu isaretcisi (sabit)
+        L.circleMarker([GS_LAT, GS_LON], {
+            radius: 7, color: '#00E676', weight: 2,
+            fillColor: '#00E676', fillOpacity: 0.75
+        }).addTo(map).bindPopup('<b>📡 Yer İstasyonu</b><br>' + GS_LAT.toFixed(6) + ', ' + GS_LON.toFixed(6));
 
         var rocketMarker = null; var payloadMarker = null;
         var rFirst = true; var pFirst = true;
