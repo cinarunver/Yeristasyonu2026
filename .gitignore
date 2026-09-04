@@ -75,3 +75,13 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 map_internal.html
+
+# Offline harita tile onbellegi (tile_indir.py ile uretilir, ~300 MB)
+# Git'e girmez; her makinede "python3 tile_indir.py --kademeli" ile indirilir.
+assets/tiles/
+
+# CARTO basemap API anahtari (gizli — repoya girmez)
+carto_key.txt
+
+# Ruflo/claude-flow arac ciktisi (projeye ait degil)
+.claude-flow/

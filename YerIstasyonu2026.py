@@ -46,6 +46,16 @@
 #   (qx,qy,qz x10000) eklendi. Format '<HhHhH2i7h'.
 # - 3B sekmesi iki bağımsız yönelim paneline ayrıldı (roket | görev yükü):
 #   quaternion ile sürülen 3B model + yapay ufuk/yaw pusulası + dönüş hızı barları.
+# --- ✓ YAPILDI (2026-09-04 — taşma korumasında sessiz paket kaybı) ---
+# - DÜZELTME: taşma koruması (buf > frame_size*20 → son 2 çerçeveye kırp)
+#   ayrıştırma döngüsünden ÖNCE çalışıyordu. Eşik 2 saniyelik telemetriye denk
+#   geliyor; arayüz ~2 sn takılırsa (ağır harita/3B render, GC duraklaması)
+#   birikmiş ama TAMAMEN ÇÖZÜLEBİLİR ~23 paket ayrıştırılmadan siliniyordu.
+#   Kayıp paket_hata sayacına da yansımadığı için arayüzde hiçbir iz bırakmıyor,
+#   apoje/ayrılma anına denk gelirse o kritik saniyeler kaybolabiliyordu.
+#   Kırpma ayrıştırmadan SONRAYA alındı: döngü çözülebilen her çerçeveyi zaten
+#   tükettiğinden geriye yalnızca kısmi çerçeve ya da SYNC'siz çöp kalır, yani
+#   kırpma artık asla geçerli paket düşürmez. Bellek sınırı korunuyor.
 # ==============================================================================
 # YER İSTASYONU v3.2 — FRAMED BINARY TELEMETRİ PROTOKOLü (FIXED-POINT WIRE)
 # Roket : ESP32 UcusYazilimi/src/main.cpp → E32-433T30D LoRa @9600, ~10 Hz
@@ -305,30 +315,112 @@ MAP_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="assets/leaflet.css"/>
     <script src="assets/leaflet.js"></script>
-    <style> 
-        body { margin: 0; padding: 0; background-color: #000; } 
-        #map { height: 100vh; width: 100vw; background: #000; } 
+    <style>
+        body { margin: 0; padding: 0; background-color: #000; }
+        #map { height: 100vh; width: 100vw; background: #000; }
+
+        /* --- PUSULA PANELI (sol-alt kose) --------------------------------
+           Elde pusulayla arama icin: her hedefe GERCEK KUZEY'e gore yon
+           (bearing) + mesafe. Roket ve gorev yuku AYRI kadranlarda.        */
+        #pusula-panel {
+            position: absolute; left: 12px; bottom: 22px; z-index: 1000;
+            display: flex; gap: 10px;
+            font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+            color: #D4D4D4; user-select: none;
+        }
+        .pusula-kart {
+            background: rgba(20,20,20,0.88);
+            border: 1px solid #3A3A3A; border-radius: 8px;
+            padding: 8px 10px 9px; width: 132px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.6);
+        }
+        .pusula-baslik {
+            font-size: 12px; font-weight: 600; text-align: center;
+            margin-bottom: 6px; letter-spacing: 0.3px;
+        }
+        .pusula-kadran { display: block; margin: 0 auto; }
+        .pusula-veri { text-align: center; margin-top: 5px; line-height: 1.35; }
+        .pusula-yon    { font-size: 17px; font-weight: 700; }
+        .pusula-mesafe { font-size: 12px; color: #9E9E9E; }
+        .pusula-bekle  { font-size: 11px; color: #757575; font-style: italic; }
     </style>
 </head>
 <body>
     <div id="map"></div>
+
+    <!-- Pusula paneli: iki bagimsiz kadran (roket | gorev yuku) -->
+    <div id="pusula-panel">
+        <div class="pusula-kart">
+            <div class="pusula-baslik" style="color:#4FC3F7;">🚀 ROKET</div>
+            <svg class="pusula-kadran" id="pusula-rocket" width="112" height="112" viewBox="0 0 112 112"></svg>
+            <div class="pusula-veri" id="veri-rocket">
+                <div class="pusula-bekle">GPS bekleniyor…</div>
+            </div>
+        </div>
+        <div class="pusula-kart">
+            <div class="pusula-baslik" style="color:#FFB74D;">🛰️ GÖREV YÜKÜ</div>
+            <svg class="pusula-kadran" id="pusula-payload" width="112" height="112" viewBox="0 0 112 112"></svg>
+            <div class="pusula-veri" id="veri-payload">
+                <div class="pusula-bekle">GPS bekleniyor…</div>
+            </div>
+        </div>
+    </div>
     <script>
         // Yer istasyonu sabit konumu (acilista harita buraya odaklanir)
-        var GS_LAT = 41.634034, GS_LON = 26.624274;
+        // 2026-09-04: atis alaninda bulundugumuz nokta (onceki deger Muhendislik'ti)
+        var GS_LAT = 38.401831, GS_LON = 33.704852;
 
         var map = L.map('map').setView([GS_LAT, GS_LON], 16);
 
         // 1. Harita Katmanları (Base Layers)
-        var darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
-            maxZoom: 19, attribution: '© OpenStreetMap © CartoDB'
+        // CARTO anahtari (bkz. carto_key.txt / CARTO_API_KEY). Bos ise CARTO
+        // katmanlari tile'lari "API KEY REQUIRED" filigraniyla dondurur.
+        var CARTO_KEY = '__CARTO_KEY__';
+        var _ck = CARTO_KEY ? ('?key=' + CARTO_KEY) : '';
+
+        var darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png' + _ck, {
+            maxZoom: 19, subdomains: 'abcd', attribution: '© OpenStreetMap © CARTO'
+        });
+
+        var voyagerLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png' + _ck, {
+            maxZoom: 20, subdomains: 'abcd',
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>, &copy; <a href="https://carto.com/attributions">CARTO</a>'
         });
 
         var topoLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
             maxZoom: 19, attribution: 'Tiles © Esri'
         });
 
-        var satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-            maxZoom: 19, attribution: 'Tiles © Esri'
+        // --- UYDU: OFFLINE-ONCELIKLI KATMAN (2026-09-04) ---------------------
+        // Sahada internet yok. tile_indir.py ile indirilen tile'lar
+        // assets/tiles/{z}/{x}/{y}.jpg altinda durur. Once ORAYA bakilir;
+        // dosya yoksa (404/yuklenemedi) ayni tile Esri CDN'inden istenir.
+        // Boylece internet varken de yokken de harita calisir.
+        var OfflineTileLayer = L.TileLayer.extend({
+            createTile: function (coords, done) {
+                var tile = document.createElement('img');
+                tile.alt = '';
+                var yedek = 'https://server.arcgisonline.com/ArcGIS/rest/services/'
+                          + 'World_Imagery/MapServer/tile/'
+                          + coords.z + '/' + coords.y + '/' + coords.x;
+
+                L.DomEvent.on(tile, 'load', L.bind(this._tileOnLoad, this, done, tile));
+                L.DomEvent.on(tile, 'error', L.bind(function () {
+                    if (!tile._yedekDenendi) {
+                        tile._yedekDenendi = true;   // yerelde yok -> CDN'e dus
+                        tile.src = yedek;
+                    } else {
+                        this._tileOnError(done, tile, new Error('tile yok'));
+                    }
+                }, this));
+
+                tile.src = 'assets/tiles/' + coords.z + '/' + coords.x + '/' + coords.y + '.jpg';
+                return tile;
+            }
+        });
+
+        var satelliteLayer = new OfflineTileLayer('', {
+            maxZoom: 19, attribution: 'Tiles © Esri (yerel önbellek + CDN)'
         });
 
         // Varsayılan olarak Koyu Katmanı ekle
@@ -337,8 +429,9 @@ MAP_HTML = """
         // Katman Seçim Kontrolü (Layer Switcher Pop-up)
         var baseMaps = {
             "Koyu Harita": darkLayer,
+            "Voyager (yol/yer adları)": voyagerLayer,
             "Karasal Harita": topoLayer,
-            "Uydu Haritası": satelliteLayer
+            "Uydu Haritası (offline)": satelliteLayer
         };
         L.control.layers(baseMaps, null, { position: 'topright' }).addTo(map);
 
@@ -358,16 +451,111 @@ MAP_HTML = """
         L.circleMarker([GS_LAT, GS_LON], {
             radius: 7, color: '#00E676', weight: 2,
             fillColor: '#00E676', fillOpacity: 0.75
-        }).addTo(map).bindPopup('<b>📡 Yer İstasyonu</b><br>' + GS_LAT.toFixed(6) + ', ' + GS_LON.toFixed(6));
+        }).addTo(map).bindPopup('<b>📡 Yer İstasyonu</b><br>Atış Alanı<br>'
+            + GS_LAT.toFixed(6) + ', ' + GS_LON.toFixed(6));
 
         var rocketMarker = null; var payloadMarker = null;
         var rFirst = true; var pFirst = true;
+
+        // ================= PUSULA =================
+        // Yer istasyonundan hedefe GERCEK KUZEY'e gore yon (bearing) + mesafe.
+        // Elde pusulayla arazide yurunecegi icin kadran KUZEY SABIT cizilir:
+        // sen pusulani kuzeye hizala, ok hangi yonu gosteriyorsa oraya yuru.
+        // NOT: bearing GERCEK kuzeye goredir; manyetik pusulada sapma (deklinasyon)
+        // vardir. Turkiye'de ~+5-6 derece dogu; hassas is icin pusuladan bu kadar
+        // dusulmeli. Yuzlerce metrelik arama icin fark pratikte onemsiz.
+        var YON_ADI = ['K','KKD','KD','DKD','D','DGD','GD','GGD',
+                       'G','GGB','GB','BGB','B','BKB','KB','KKB'];
+
+        function _yonAdi(brg) {
+            return YON_ADI[Math.round(brg / 22.5) % 16];
+        }
+
+        // Great-circle bearing (ileri azimut), derece [0,360)
+        function _bearing(lat1, lon1, lat2, lon2) {
+            var f1 = lat1 * Math.PI/180, f2 = lat2 * Math.PI/180;
+            var dl = (lon2 - lon1) * Math.PI/180;
+            var y = Math.sin(dl) * Math.cos(f2);
+            var x = Math.cos(f1)*Math.sin(f2) - Math.sin(f1)*Math.cos(f2)*Math.cos(dl);
+            return (Math.atan2(y, x) * 180/Math.PI + 360) % 360;
+        }
+
+        // Haversine mesafe (metre) — R=6371008.8 m (WGS84 ortalama)
+        function _mesafe(lat1, lon1, lat2, lon2) {
+            var R = 6371008.8;
+            var f1 = lat1 * Math.PI/180, f2 = lat2 * Math.PI/180;
+            var df = (lat2 - lat1) * Math.PI/180, dl = (lon2 - lon1) * Math.PI/180;
+            var a = Math.sin(df/2)*Math.sin(df/2) +
+                    Math.cos(f1)*Math.cos(f2)*Math.sin(dl/2)*Math.sin(dl/2);
+            return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        }
+
+        // Kadranin sabit kismini (halka + K/D/G/B harfleri) bir kez ciz
+        function _kadranKur(svg) {
+            var ns = 'http://www.w3.org/2000/svg', cx = 56, cy = 56, r = 44;
+            var h = '';
+            h += '<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="#141414" stroke="#4A4A4A" stroke-width="1.5"/>';
+            // 30 derecelik tik isaretleri
+            for (var a = 0; a < 360; a += 30) {
+                var rad = (a - 90) * Math.PI/180;
+                var uzun = (a % 90 === 0);
+                var r1 = uzun ? r - 8 : r - 5;
+                h += '<line x1="'+(cx+r1*Math.cos(rad))+'" y1="'+(cy+r1*Math.sin(rad))+'" '
+                   +      'x2="'+(cx+r*Math.cos(rad))+'" y2="'+(cy+r*Math.sin(rad))+'" '
+                   +      'stroke="'+(uzun ? '#6E6E6E' : '#3E3E3E')+'" stroke-width="'+(uzun?1.6:1)+'"/>';
+            }
+            // Ana yon harfleri (K yukarida — kadran kuzeye sabit)
+            var harf = [['K',56,20,'#EF5350'],['D',92,60,'#8A8A8A'],
+                        ['G',56,99,'#8A8A8A'],['B',20,60,'#8A8A8A']];
+            for (var i = 0; i < harf.length; i++) {
+                h += '<text x="'+harf[i][1]+'" y="'+harf[i][2]+'" fill="'+harf[i][3]+'" '
+                   + 'font-size="11" font-weight="700" text-anchor="middle" '
+                   + 'font-family="-apple-system,Segoe UI,Roboto,sans-serif">'+harf[i][0]+'</text>';
+            }
+            h += '<circle cx="'+cx+'" cy="'+cy+'" r="2.5" fill="#6E6E6E"/>';
+            h += '<g id="'+svg.id+'-ok"></g>';   // ok buraya cizilecek
+            svg.innerHTML = h;
+        }
+
+        function _okCiz(svgId, brg, renk) {
+            var g = document.getElementById(svgId + '-ok');
+            if (!g) return;
+            var cx = 56, cy = 56;
+            // Ok ucu 34px disarida; kuyruk 12px geride (kuzey = yukari, saat yonu +)
+            var rad = (brg - 90) * Math.PI/180;
+            var ux = cx + 34*Math.cos(rad),        uy = cy + 34*Math.sin(rad);
+            var kx = cx - 13*Math.cos(rad),        ky = cy - 13*Math.sin(rad);
+            // Ok basi icin dik vektor
+            var px = Math.cos(rad + Math.PI/2),    py = Math.sin(rad + Math.PI/2);
+            var bx = cx + 22*Math.cos(rad),        by = cy + 22*Math.sin(rad);
+            g.innerHTML =
+                '<line x1="'+kx+'" y1="'+ky+'" x2="'+ux+'" y2="'+uy+'" stroke="'+renk+'" '
+              + 'stroke-width="3" stroke-linecap="round"/>'
+              + '<polygon points="'+ux+','+uy+' '+(bx+7*px)+','+(by+7*py)+' '
+              +         (bx-7*px)+','+(by-7*py)+'" fill="'+renk+'"/>';
+        }
+
+        function _pusulaGuncelle(ad, lat, lon, renk) {
+            var brg = _bearing(GS_LAT, GS_LON, lat, lon);
+            var d   = _mesafe(GS_LAT, GS_LON, lat, lon);
+            _okCiz('pusula-' + ad, brg, renk);
+            var dStr = (d < 1000) ? d.toFixed(0) + ' m'
+                                  : (d/1000).toFixed(2) + ' km';
+            document.getElementById('veri-' + ad).innerHTML =
+                '<div class="pusula-yon" style="color:'+renk+';">'
+              +   _yonAdi(brg) + ' ' + brg.toFixed(0) + '°</div>'
+              + '<div class="pusula-mesafe">' + dStr + '</div>';
+        }
+
+        _kadranKur(document.getElementById('pusula-rocket'));
+        _kadranKur(document.getElementById('pusula-payload'));
 
         function updateRocket(lat, lon) {
             if (rocketMarker === null) {
                 rocketMarker = L.marker([lat, lon], {icon: rocketIcon}).addTo(map).bindPopup('<b>🚀 Roket</b>').openPopup();
             } else { rocketMarker.setLatLng([lat, lon]); }
             if (rFirst) { map.setView([lat, lon], 16); rFirst = false; }
+            _pusulaGuncelle('rocket', lat, lon, '#4FC3F7');
         }
 
         function updatePayload(lat, lon) {
@@ -375,13 +563,39 @@ MAP_HTML = """
                 payloadMarker = L.marker([lat, lon], {icon: payloadIcon}).addTo(map).bindPopup('<b>🛰️ Görev Yükü</b>');
             } else { payloadMarker.setLatLng([lat, lon]); }
             if (pFirst) { map.setView([lat, lon], 16); pFirst = false; }
+            _pusulaGuncelle('payload', lat, lon, '#FFB74D');
         }
     </script>
 </body>
 </html>
 """
 
+# --- CARTO API ANAHTARI ------------------------------------------------------
+# CARTO basemap'leri (Koyu / Voyager) anahtarsiz istenirse tile'i HTTP 200 ile
+# ama uzerinde "API KEY REQUIRED" filigraniyla dondurur — yani sessizce bozulur.
+# Anahtar KODA GOMULMEZ; su sirayla aranir:
+#   1) CARTO_API_KEY ortam degiskeni
+#   2) proje kokundeki carto_key.txt  (.gitignore'da — repoya girmez)
+# Bulunamazsa uygulama yine calisir: CARTO katmanlari filigranli gelir,
+# uydu katmani (offline tile'lar + Esri) bundan etkilenmez.
+def _carto_anahtari():
+    k = os.environ.get("CARTO_API_KEY", "").strip()
+    if k:
+        return k
+    try:
+        yol = os.path.join(os.path.dirname(os.path.abspath(__file__)), "carto_key.txt")
+        with open(yol, "r", encoding="utf-8") as f:
+            for satir in f:
+                satir = satir.strip()
+                if satir and not satir.startswith("#"):
+                    return satir
+    except Exception:
+        pass
+    return ""
+
 # HTML Datasini Local Dosyaya Yaz (WebEngine Guvenlik Duvarini Asmak Icin)
+# Anahtar yalniz DISKTEKI kopyaya yazilir; kaynak kodda yer tutucu kalir.
+MAP_HTML = MAP_HTML.replace("__CARTO_KEY__", _carto_anahtari())
 map_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "map_internal.html"))
 try:
     with open(map_path, "w", encoding="utf-8") as f:
@@ -431,9 +645,6 @@ class SerialWorker(QThread):
                     waiting = self.serial_conn.in_waiting
                     if waiting > 0:
                         buf.extend(self.serial_conn.read(waiting))
-                        # Taşma koruması: hepsini silme, kuyruğu koru (kısmi çerçeve kaybolmasın)
-                        if len(buf) > frame_size * 20:
-                            del buf[:len(buf) - frame_size * 2]
                         while len(buf) >= frame_size:
                             idx = buf.find(sync)
                             if idx == -1:
@@ -457,6 +668,17 @@ class SerialWorker(QThread):
                                 # sadece SYNC'i geç ki kaymış gerçek çerçeve yakalanabilsin
                                 del buf[:2]
                                 self.paket_hata += 1
+                        # Taşma koruması — ayrıştırmadan SONRA çalışır (2026-09-04).
+                        # Döngü çözülebilen HER çerçeveyi zaten tüketti; buraya kalan
+                        # yalnızca (a) henüz tamamlanmamış kısmi çerçeve ya da
+                        # (b) SYNC içermeyen çöp olabilir. Dolayısıyla bu kırpma asla
+                        # geçerli paket düşürmez — sadece patolojik akışta (sürekli
+                        # çöp/gürültü) belleğin sınırsız büyümesini engeller.
+                        # ÖNCE kırpmak 2 sn'lik birikmiş ama TAMAMEN ÇÖZÜLEBİLİR
+                        # veriyi (~23 paket) sessizce siliyordu; arayüz donması veya
+                        # ağır render sonrası apoje/ayrılma anı kaybolabiliyordu.
+                        if len(buf) > frame_size * 20:
+                            del buf[:len(buf) - frame_size * 2]
                     else:
                         self.msleep(5)
 
