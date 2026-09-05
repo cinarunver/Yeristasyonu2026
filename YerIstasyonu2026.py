@@ -59,7 +59,7 @@
 # ==============================================================================
 # YER İSTASYONU v3.2 — FRAMED BINARY TELEMETRİ PROTOKOLü (FIXED-POINT WIRE)
 # Roket : ESP32 UcusYazilimi/src/main.cpp → E32-433T30D LoRa @9600, ~10 Hz
-#         [0xAA][0x55][LEN=23][TelemetryWire 23B][CRC16_HI][CRC16_LO] = 28B
+#         [0xAA][0x55][LEN=25][TelemetryWire 25B][CRC16_HI][CRC16_LO] = 30B
 #         TelemetryWire = ivmeToplam + quaternion(qx,qy,qz) + irtifa + dikeyHiz
 #                       + eğim + GPS(enlem,boylam) + durum bitfield.  '<7h2iB'
 # G.Yükü: ESP32 GorevYukuYazilimi/gorevyuku.cpp → E32-433T30D LoRa @9600, ~10 Hz
@@ -100,9 +100,12 @@ from collections import deque
 #   qx=0.35 ekranda roll=35.00° yaziyordu ve isaretli qz unsigned okundugu icin
 #   yaw 600°+ sacma degerler aliyordu. Artik quaternion cozulur, roll/pitch/yaw
 #   ondan turetilir (asagidaki quat_* yardimcilari).
-ROCKET_PACKET_FORMAT = '<7h2iB'
-ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 23 byte
-ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 28 byte
+# '<8h2iB' — 8. short quaternion w'sidir. ESKIDEN '<7h2iB' (23B) idi ve w yerde
+# w = sqrt(1-x^2-y^2-z^2) ile TURETILIYORDU; firmware artik w'yi aciktan
+# gonderiyor (bkz. main.cpp TelemetryWire ustundeki "w NEDEN ACIKCA GONDERILIR").
+ROCKET_PACKET_FORMAT = '<8h2iB'
+ROCKET_PACKET_SIZE = struct.calcsize(ROCKET_PACKET_FORMAT) # 25 byte
+ROCKET_FRAME_SIZE = 2 + 1 + ROCKET_PACKET_SIZE + 2 # 30 byte
 
 # GorevYukuWire (32B): basinc (uint16 hPa x10), sicaklik (int16 x100),
 #   nem (uint16 x100), irtifa (int16 x10), yogunluk (uint16 kg/m^3 x1000),
@@ -138,9 +141,11 @@ def quat_w(x, y, z):
     return math.sqrt(kare) if kare > 0.0 else 0.0   # quantize hatasi negatife dusurebilir
 
 def _euler_to_quat(roll_deg, pitch_deg, yaw_deg):
-    """(roll, pitch, yaw) derece -> (qx, qy, qz), w>=0 normalize.
+    """(roll, pitch, yaw) derece -> (qx, qy, qz, qw).
     Yalniz SIMULATOR icin: firmware'in yolladigi gosterimi taklit eder ki
-    simulasyon da gercek ucusla ayni parse/3B yolundan gecsin."""
+    simulasyon da gercek ucusla ayni parse/3B yolundan gecsin.
+    w>=0 normalizasyonu KORUNDU: gorev yuku hala w'siz format kullaniyor ve
+    onun parse yolu w'yi turetiyor; sim ile gercek ayni kalsin diye."""
     cr, sr = math.cos(math.radians(roll_deg)*0.5),  math.sin(math.radians(roll_deg)*0.5)
     cp, sp = math.cos(math.radians(pitch_deg)*0.5), math.sin(math.radians(pitch_deg)*0.5)
     cy, sy = math.cos(math.radians(yaw_deg)*0.5),   math.sin(math.radians(yaw_deg)*0.5)
@@ -149,7 +154,7 @@ def _euler_to_quat(roll_deg, pitch_deg, yaw_deg):
     y = cr*sp*cy + sr*cp*sy
     z = cr*cp*sy - sr*sp*cy
     sgn = -1.0 if w < 0.0 else 1.0    # firmware ile ayni: w>=0 garantisi
-    return sgn*x, sgn*y, sgn*z
+    return sgn*x, sgn*y, sgn*z, sgn*w
 
 def _hava_yogunlugu(p_hpa, t_c, rh_pct):
     """Nemli hava yogunlugu (kg/m^3) — gorevyuku.cpp ile BIREBIR ayni formul.
@@ -161,6 +166,17 @@ def _hava_yogunlugu(p_hpa, t_c, rh_pct):
     pd = p_hpa - pv
     tk = max(1.0, t_c + 273.15)
     return (pd * 100.0) / (287.058 * tk) + (pv * 100.0) / (461.495 * tk)
+
+def quat_to_euler_w(x, y, z, w):
+    """Quaternion (w ACIKTAN verilir) -> (roll, pitch, yaw) derece.
+    Roket paketi icin: firmware w'yi gonderdiginden turetmeye gerek yok.
+    Gorev yuku hala w'siz format kullandigi icin quat_to_euler() korunur."""
+    roll = math.degrees(math.atan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y)))
+    sinp = max(-1.0, min(1.0, 2.0*(w*y - z*x)))
+    pitch = math.degrees(math.asin(sinp))
+    yaw = math.degrees(math.atan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z)))
+    return roll, pitch, yaw
+
 
 def quat_to_euler(x, y, z):
     """Quaternion -> (roll, pitch, yaw) derece. Yalniz gosterge/CSV icin;
@@ -193,7 +209,7 @@ ROCKET_CSV_ALANLARI = [
     ('zaman_s', None, 3), ('saat', None, None),
     ('irtifa_m', 'irtifa', 2), ('dikeyHiz_ms', 'dikeyHiz', 2), ('eglim_derece', 'eglimAcisi', 2),
     ('ivmeToplam', 'ivmeToplam', 3),   # bileske ivme; ham eksenler+gyro havadan gelmiyor (SD'de tam kayitli)
-    ('qx', 'qx', 4), ('qy', 'qy', 4), ('qz', 'qz', 4),   # havadan gelen yonelim (ham)
+    ('qx', 'qx', 4), ('qy', 'qy', 4), ('qz', 'qz', 4), ('qw', 'qw', 4),   # havadan gelen yonelim (ham, w dahil)
     ('roll', 'roll', 2), ('pitch', 'pitch', 2), ('yaw', 'yaw', 2),   # quaternion'dan turetildi
     ('gpsEnlem', 'gpsEnlem', 7), ('gpsBoylam', 'gpsBoylam', 7),
     ('ayrilma1', 'ayrilma1_durum', None), ('ayrilma2', 'ayrilma2_durum', None),
@@ -235,18 +251,19 @@ def parse_rocket_frame(raw: bytes):
     crc_recv = (raw[3 + ROCKET_PACKET_SIZE] << 8) | raw[3 + ROCKET_PACKET_SIZE + 1]
     if crc16_ccitt(payload) != crc_recv: return None
     v = struct.unpack(ROCKET_PACKET_FORMAT, payload)
-    durum = v[9]   # '<7h2iB' -> 10 deger: v[9] = durum bitfield byte
+    durum = v[10]  # '<8h2iB' -> 11 deger: v[10] = durum bitfield byte
     qx, qy, qz = v[1] / WIRE_OLCEK_QUAT, v[2] / WIRE_OLCEK_QUAT, v[3] / WIRE_OLCEK_QUAT
-    roll, pitch, yaw = quat_to_euler(qx, qy, qz)
+    qw = v[4] / WIRE_OLCEK_QUAT   # ARTIK TURETILMIYOR — telemetriden geliyor
+    roll, pitch, yaw = quat_to_euler_w(qx, qy, qz, qw)
     return {
         'ivmeToplam': v[0] / WIRE_OLCEK_IVME,   # bileske ivme sqrt(x^2+y^2+z^2) (ham eksenler havadan gelmiyor)
-        'qx': qx, 'qy': qy, 'qz': qz, 'qw': quat_w(qx, qy, qz),
+        'qx': qx, 'qy': qy, 'qz': qz, 'qw': qw,
         'roll': roll, 'pitch': pitch, 'yaw': yaw,   # quaternion'dan turetildi (gosterge/CSV icin)
-        'irtifa':     v[4] / WIRE_OLCEK_IRTIFA,
-        'dikeyHiz':   v[5] / WIRE_OLCEK_HIZ,
-        'eglimAcisi': v[6] / WIRE_OLCEK_ACI,
-        'gpsEnlem':   v[7] / WIRE_OLCEK_GPS,
-        'gpsBoylam':  v[8] / WIRE_OLCEK_GPS,
+        'irtifa':     v[5] / WIRE_OLCEK_IRTIFA,
+        'dikeyHiz':   v[6] / WIRE_OLCEK_HIZ,
+        'eglimAcisi': v[7] / WIRE_OLCEK_ACI,
+        'gpsEnlem':   v[8] / WIRE_OLCEK_GPS,
+        'gpsBoylam':  v[9] / WIRE_OLCEK_GPS,
         'ayrilma1_durum': bool(durum & 0x01),
         'ayrilma2_durum': bool(durum & 0x02),
         'ucus_durumu':    (durum >> 2) & 0x07,
@@ -790,7 +807,7 @@ class SerialWorker(QThread):
             # Firmware ile ayni yonelim gosterimi: Euler -> quaternion (w>=0 normalize).
             # Simulator da havadan quaternion yolladigi icin parse/3B yolu gercek
             # ucusla birebir ayni kodu kullanir.
-            sqx, sqy, sqz = _euler_to_quat(r, p, yaw_a)
+            sqx, sqy, sqz, sqw = _euler_to_quat(r, p, yaw_a)
 
             if self.identifier == "rocket":
                 # Firmware quantize esdegeri: float -> packed int (paket kucultme, clamp'li)
@@ -800,6 +817,7 @@ class SerialWorker(QThread):
                     _qi16(sqx * WIRE_OLCEK_QUAT),                           # qx x10000
                     _qi16(sqy * WIRE_OLCEK_QUAT),                           # qy x10000
                     _qi16(sqz * WIRE_OLCEK_QUAT),                           # qz x10000
+                    _qi16(sqw * WIRE_OLCEK_QUAT),                           # qw x10000 (aciktan)
                     _qi16(sent_alt * WIRE_OLCEK_IRTIFA),                    # irtifa x10
                     _qi16(vel * WIRE_OLCEK_HIZ),                            # dikeyHiz x10
                     _qi16((p % 90) * WIRE_OLCEK_ACI),                       # eglim x100
@@ -869,8 +887,12 @@ class SerialWorker(QThread):
 class Rocket3DWidget(QOpenGLWidget):
     """Gercek zamanli 3B yonelim. Quaternion ile surulur — Euler'e HIC ugranmaz,
     boylece dik ucusta gimbal lock yasanmaz (roll/pitch/yaw yalniz gosterge icin
-    ayrica turetilir). set_quat(x, y, z) cagrilir; w firmware garantisi (w>=0)
-    sayesinde birim kuaterniyon kosulundan geri hesaplanir."""
+    ayrica turetilir). set_quat(x, y, z, w) cagrilir; w ARTIK TELEMETRIDEN gelir.
+
+    Eskiden w yerde w=sqrt(1-x^2-y^2-z^2) ile kurulurdu ve bu her zaman >=0
+    cikardigi icin roket theta=180 civarina yaklastiginda (w sifirdan gecerken)
+    firmware uc bileseni birden cevirir, ekranda roket saga yatarken bir kare
+    SOLA sicrayip geri donerdi. w aciktan geldigi icin bu artik olmuyor."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -889,9 +911,15 @@ class Rocket3DWidget(QOpenGLWidget):
                 0.0, 0.0, 1.0, 0.0,
                 0.0, 0.0, 0.0, 1.0]
 
-    def set_quat(self, x, y, z):
+    def set_quat(self, x, y, z, w=None):
+        # w telemetriden gelir (roket). Verilmezse birim kuaterniyon kosulundan
+        # turetilir — yalniz w gondermeyen kaynaklar (gorev yuku) icin geriye
+        # donuk uyumluluk; turetilen w her zaman >=0 oldugundan theta=180
+        # civarinda isaret sicramasi yasatir, bkz. asagidaki not.
+        if w is None:
+            w = quat_w(x, y, z)
         self.qx, self.qy, self.qz = x, y, z
-        self.qw = w = quat_w(x, y, z)
+        self.qw = w
         # Quaternion -> 4x4 rotasyon matrisi (OpenGL SUTUN-oncelikli bekler)
         xx, yy, zz = x*x, y*y, z*z
         xy, xz, yz = x*y, x*z, y*z
@@ -951,6 +979,13 @@ class Rocket3DWidget(QOpenGLWidget):
         glRotatef(self.cam_rot_x, 1.0, 0.0, 0.0)
         glRotatef(self.cam_rot_y, 0.0, 1.0, 0.0)
         
+        # Z-up -> Y-up: firmware kuaterniyonu Z-up konvansiyonundadir (govde +Z =
+        # burun; eglim_acisi = acos(1 - 2*(qx^2+qy^2)) tam bunu olcer ve roket
+        # dik dururken 0 okur). Bu sahne ise Y-up: zemin izgarasi y=-2.5
+        # duzleminde yatay cizilir. Donusum olmadan dik roket YATAY gorunuyordu.
+        # -90 derece X ekseninde donus, veri eksenini sahne eksenine oturtur.
+        glRotatef(-90.0, 1.0, 0.0, 0.0)
+
         glMultMatrixf(self._mat)   # quaternion rotasyonu (gimbal lock yok)
 
         glLineWidth(3.0)
@@ -965,6 +1000,13 @@ class Rocket3DWidget(QOpenGLWidget):
 
         glRotatef(self.cam_rot_x, 1.0, 0.0, 0.0)
         glRotatef(self.cam_rot_y, 0.0, 1.0, 0.0)
+
+        # Z-up -> Y-up: firmware kuaterniyonu Z-up konvansiyonundadir (govde +Z =
+        # burun; eglim_acisi = acos(1 - 2*(qx^2+qy^2)) tam bunu olcer ve roket
+        # dik dururken 0 okur). Bu sahne ise Y-up: zemin izgarasi y=-2.5
+        # duzleminde yatay cizilir. Donusum olmadan dik roket YATAY gorunuyordu.
+        # -90 derece X ekseninde donus, veri eksenini sahne eksenine oturtur.
+        glRotatef(-90.0, 1.0, 0.0, 0.0)
 
         glMultMatrixf(self._mat)   # quaternion rotasyonu (gimbal lock yok)
 
@@ -1423,7 +1465,7 @@ class YonelimPaneli(QWidget):
         if 'qx' not in packet:
             return
         if self.gl is not None:
-            self.gl.set_quat(packet['qx'], packet['qy'], packet['qz'])
+            self.gl.set_quat(packet['qx'], packet['qy'], packet['qz'], packet.get('qw'))
         self.ufuk.set_attitude(packet['roll'], packet['pitch'], packet['yaw'])
         self.gyro.set_gyro(packet.get('gyroX', 0.0),
                            packet.get('gyroY', 0.0),
