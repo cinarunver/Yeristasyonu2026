@@ -595,12 +595,29 @@ MAP_HTML = """
 #   2) proje kokundeki carto_key.txt  (.gitignore'da — repoya girmez)
 # Bulunamazsa uygulama yine calisir: CARTO katmanlari filigranli gelir,
 # uydu katmani (offline tile'lar + Esri) bundan etkilenmez.
+# PyInstaller ile paketlendiginde kod gecici bir dizine (sys._MEIPASS) acilir;
+# assets/ ve leaflet dosyalari oraya kopyalanir. Kaynak (okunacak) dosyalar
+# icin _kaynak_dizini(), yazilabilir ciktilar icin _yazma_dizini() kullanilir.
+def _kaynak_dizini():
+    taban = getattr(sys, "_MEIPASS", None)
+    if taban:
+        return taban
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+# map_internal.html, assets/ ile AYNI dizinde olmali: harita HTML'i
+# "assets/leaflet.js" gibi GORECELI yollar kullanir. Bu yuzden kaynak
+# dizinine yazilir (_MEIPASS paketli calismada yazilabilirdir).
+def _yazma_dizini():
+    return _kaynak_dizini()
+
+
 def _carto_anahtari():
     k = os.environ.get("CARTO_API_KEY", "").strip()
     if k:
         return k
     try:
-        yol = os.path.join(os.path.dirname(os.path.abspath(__file__)), "carto_key.txt")
+        yol = os.path.join(_kaynak_dizini(), "carto_key.txt")
         with open(yol, "r", encoding="utf-8") as f:
             for satir in f:
                 satir = satir.strip()
@@ -613,12 +630,15 @@ def _carto_anahtari():
 # HTML Datasini Local Dosyaya Yaz (WebEngine Guvenlik Duvarini Asmak Icin)
 # Anahtar yalniz DISKTEKI kopyaya yazilir; kaynak kodda yer tutucu kalir.
 MAP_HTML = MAP_HTML.replace("__CARTO_KEY__", _carto_anahtari())
-map_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "map_internal.html"))
+map_path = os.path.abspath(os.path.join(_yazma_dizini(), "map_internal.html"))
 try:
     with open(map_path, "w", encoding="utf-8") as f:
         f.write(MAP_HTML)
 except Exception:
-    pass
+    # Kaynak dizini salt-okunursa (ornegin macOS .app icinde) haritayi
+    # yazamayiz; setHtml geri donusu assets/ yollarini cozemeyecegi icin
+    # map_path'i gecersiz kilarak en azindan cevrimici katmanlari birakiriz.
+    map_path = ""
 
 # ----------------- SERIAL WORKER (QTHREAD) -----------------
 class SerialWorker(QThread):
@@ -1795,11 +1815,13 @@ class SerialViewerApp(QMainWindow):
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         
-        if os.path.exists(map_path):
+        if map_path and os.path.exists(map_path):
             self.web_view.setUrl(QUrl.fromLocalFile(map_path))
         else:
-            # Fallback olarak html string bas (Eski usul)
-            self.web_view.setHtml(MAP_HTML, QUrl("http://localhost"))
+            # Fallback: HTML'i dogrudan bas. Taban URL kaynak dizinini
+            # gostermeli, yoksa "assets/..." goreceli yollari cozulmez.
+            taban = QUrl.fromLocalFile(os.path.join(_kaynak_dizini(), ""))
+            self.web_view.setHtml(MAP_HTML, taban)
             
         map_layout.addWidget(self.web_view)
         self.tabs.addTab(self.tab_map, "🗺️ Canlı GPS Haritası")
@@ -2474,7 +2496,37 @@ class SerialViewerApp(QMainWindow):
         self._csv_kapat()  # açık CSV dosyalarını flush edip kapat
         event.accept()
 
+def _paket_kontrolu():
+    """--check: CI icin dumansiz test.
+
+    Paketlenmis ikilinin gercekten ayaga kalktigini dogrular: Qt yuklenir,
+    ana pencere kurulur, harita kaynaklari yerinde mi bakilir ve cikilir.
+    Ekran gerektirmez (offscreen platform ile calistirilir).
+    """
+    sorunlar = []
+    kaynak = _kaynak_dizini()
+    for gerekli in ("assets/leaflet.js", "assets/leaflet.css"):
+        if not os.path.exists(os.path.join(kaynak, gerekli)):
+            sorunlar.append("eksik kaynak: " + gerekli)
+    if not map_path:
+        sorunlar.append("map_internal.html yazilamadi")
+
+    app = QApplication(sys.argv)
+    window = SerialViewerApp()   # tum sekmeler + OpenGL + WebEngine kurulur
+    window.show()
+    app.processEvents()
+    window.close()
+
+    if sorunlar:
+        print("KONTROL BASARISIZ: " + "; ".join(sorunlar))
+        return 1
+    print("KONTROL TAMAM: arayuz kuruldu, harita kaynaklari yerinde.")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--check" in sys.argv:
+        sys.exit(_paket_kontrolu())
     app = QApplication(sys.argv)
     window = SerialViewerApp()
     window.show()

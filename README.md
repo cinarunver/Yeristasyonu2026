@@ -191,6 +191,46 @@ Roll/Pitch/Yaw yalnızca **gösterge ve CSV** için türetilir.
 | [map_internal.html](map_internal.html) | Harita sayfası (çalışma anında üretilir, git'te izlenmez). |
 | [assets/](assets/) | Yerel Leaflet js/css + marker ikonları (+ `tiles/` offline uydu önbelleği). |
 | `carto_key.txt` | CARTO basemap API anahtarı — **git'e girmez**, her makinede ayrıca oluşturulur (bkz. Kurulum). |
+| [YerIstasyonu2026.spec](YerIstasyonu2026.spec) | PyInstaller yapılandırması (Windows / Linux / macOS ortak). |
+| [.github/workflows/build.yml](.github/workflows/build.yml) | GitHub Actions CI/CD — üç platformda derler, test eder, sürüm yayınlar. |
+
+## Derleme (CI/CD)
+
+Her `main` push'unda ve PR'da GitHub Actions dört hedefte paket üretir:
+**Windows x64**, **Linux x64**, **macOS Intel**, **macOS Apple Silicon**.
+
+Derlenen paketler ilgili çalışmanın **Artifacts** bölümünden indirilir
+(30 gün saklanır). Sürüm yayınlamak için etiket atmak yeterli:
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+Bu, dört paketi de zip'leyip GitHub Release'e ekler.
+
+**Dumansız test.** CI yalnızca "dosya oluştu mu" diye bakmaz; üretilen ikiliyi
+`--check` ile gerçekten çalıştırır. Qt yüklenir, tüm sekmeler (3B + WebEngine
+haritası dahil) kurulur ve harita kaynaklarının pakete girdiği doğrulanır.
+Eksik varsa derleme kırmızıya döner. Yerelde de çalıştırılabilir:
+
+```bash
+python3 YerIstasyonu2026.py --check
+```
+
+**Yerel paketleme:**
+
+```bash
+pip install pyinstaller
+pyinstaller --noconfirm --clean YerIstasyonu2026.spec
+# -> dist/YerIstasyonu2026/  (macOS'ta ayrıca dist/YerIstasyonu2026.app)
+```
+
+> `assets/tiles/` (~300 MB) git'e girmediği için CI paketlerinde **offline
+> tile'lar bulunmaz**; harita çevrimiçi Esri katmanına düşer. Sahada offline
+> harita gerekiyorsa `python3 tile_indir.py --kademeli` çalıştırıp paketi
+> yerelde üretin.
+
+---
 
 ### hz_olcer.py
 
