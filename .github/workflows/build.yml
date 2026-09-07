@@ -137,15 +137,23 @@ jobs:
         with:
           path: indirilen
 
+      # macOS artifact'i zaten tek bir .zip (ditto ile uretildi) — onu oldugu
+      # gibi al, yeniden zip'leme (yoksa kullanici ic ice iki zip acar).
+      # Windows/Linux ise klasor olarak iniyor; onlari zip'le.
       - name: Arsivle
         run: |
+          set -euo pipefail
           mkdir -p cikti
-          cd indirilen
-          for d in */; do
-            ad="${d%/}"
-            (cd "$ad" && zip -qr "../../cikti/${ad}.zip" .)
+          for d in indirilen/*/; do
+            ad="$(basename "$d")"
+            ic_zip="$(find "$d" -maxdepth 1 -name '*.zip' -print -quit)"
+            if [ -n "$ic_zip" ]; then
+              mv "$ic_zip" "cikti/${ad}.zip"
+            else
+              (cd "$d" && zip -qr "$OLDPWD/cikti/${ad}.zip" .)
+            fi
           done
-          ls -lh ../cikti
+          ls -lh cikti
 
       - name: Release olustur
         uses: softprops/action-gh-release@v2
