@@ -196,8 +196,12 @@ Roll/Pitch/Yaw yalnızca **gösterge ve CSV** için türetilir.
 
 ## Derleme (CI/CD)
 
-Her `main` push'unda ve PR'da GitHub Actions dört hedefte paket üretir:
-**Windows x64**, **Linux x64**, **macOS Intel**, **macOS Apple Silicon**.
+Her `main` push'unda ve PR'da GitHub Actions üç hedefte paket üretir:
+**Windows x64**, **Linux x64**, **macOS Apple Silicon**.
+
+> Intel Mac paketi üretilmiyor: GitHub'ın `macos-13` (Intel) runner kuyruğu
+> çok uzun. Apple Silicon paketi Intel Mac'te **çalışmaz**; gerekirse
+> `.github/workflows/build.yml` içindeki matrise `macos-13` geri eklenir.
 
 Derlenen paketler ilgili çalışmanın **Artifacts** bölümünden indirilir
 (30 gün saklanır). Sürüm yayınlamak için etiket atmak yeterli:
@@ -206,7 +210,7 @@ Derlenen paketler ilgili çalışmanın **Artifacts** bölümünden indirilir
 git tag v1.0.0 && git push origin v1.0.0
 ```
 
-Bu, dört paketi de zip'leyip GitHub Release'e ekler.
+Bu, üç paketi de zip'leyip GitHub Release'e ekler.
 
 **Dumansız test.** CI yalnızca "dosya oluştu mu" diye bakmaz; üretilen ikiliyi
 `--check` ile gerçekten çalıştırır. Qt yüklenir, tüm sekmeler (3B + WebEngine

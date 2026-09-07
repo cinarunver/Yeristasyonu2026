@@ -32,9 +32,9 @@ jobs:
           - os: ubuntu-22.04
             ad: Linux (x64)
             artifact: YerIstasyonu2026-linux-x64
-          - os: macos-13
-            ad: macOS (Intel)
-            artifact: YerIstasyonu2026-macos-intel
+          # macos-13 (Intel) runner'lari GitHub kuyrugunda cok bekliyor;
+          # matristen cikarildi. Intel Mac gerekirse geri eklenebilir —
+          # ARM paketi Rosetta ile CALISMAZ, ayri derleme sarttir.
           - os: macos-14
             ad: macOS (Apple Silicon)
             artifact: YerIstasyonu2026-macos-arm64
